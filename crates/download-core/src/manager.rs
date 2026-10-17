@@ -12,6 +12,10 @@ impl TaskManager {
         Self::default()
     }
 
+    /// Registers a new download task, or returns the existing id if the URL is already known.
+    ///
+    /// The URL string is indexed at insert time for deduplication; it must not be changed
+    /// afterward (see [`Self::get_mut`]).
     pub fn add(&mut self, req: NewTaskRequest) -> Result<TaskId, String> {
         if req.url.is_empty() {
             return Err("url required".into());
@@ -34,6 +38,12 @@ impl TaskManager {
         self.tasks.get(id)
     }
 
+    /// Returns a mutable reference to the task with the given id.
+    ///
+    /// **Do not mutate [`DownloadTask::url`]** on the returned task. URL deduplication
+    /// (`by_url`) is keyed on the URL at insert time; changing `url` without updating
+    /// `TaskManager`'s internal index will desync lookups such as [`Self::find_by_url`]
+    /// and duplicate adds for the new URL.
     pub fn get_mut(&mut self, id: &TaskId) -> Option<&mut DownloadTask> {
         self.tasks.get_mut(id)
     }
