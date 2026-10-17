@@ -1,4 +1,5 @@
 use download_core::aria2::rpc::Aria2Client;
+use download_core::engine::Aria2Api;
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -17,8 +18,7 @@ async fn add_uri_returns_gid() {
         .await;
 
     let client = Aria2Client::new(format!("{}/jsonrpc", server.uri()), None);
-    let gid = client
-        .add_uri("http://example.com/file.bin", "/tmp", "file.bin")
+    let gid = Aria2Api::add_uri(&client, "http://example.com/file.bin", "/tmp", "file.bin")
         .await
         .unwrap();
     assert_eq!(gid, "2089b05ecca3d829");

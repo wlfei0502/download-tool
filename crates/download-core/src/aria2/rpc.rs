@@ -1,3 +1,5 @@
+use crate::engine::Aria2Api;
+use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -83,9 +85,39 @@ impl Aria2Client {
             "aria2.tellStatus",
             vec![
                 json!(gid),
-                json!(["status", "totalLength", "completedLength", "downloadSpeed"]),
+                json!([
+                    "status",
+                    "totalLength",
+                    "completedLength",
+                    "downloadSpeed",
+                    "errorMessage"
+                ]),
             ],
         )
         .await
+    }
+}
+
+#[async_trait]
+impl Aria2Api for Aria2Client {
+    // `Self::…` is the inherent RPC method. Calling the trait method would recurse.
+    async fn add_uri(&self, url: &str, dir: &str, out: &str) -> Result<String, String> {
+        Self::add_uri(self, url, dir, out).await
+    }
+
+    async fn pause(&self, gid: &str) -> Result<(), String> {
+        Self::pause(self, gid).await
+    }
+
+    async fn unpause(&self, gid: &str) -> Result<(), String> {
+        Self::unpause(self, gid).await
+    }
+
+    async fn remove(&self, gid: &str) -> Result<(), String> {
+        Self::remove(self, gid).await
+    }
+
+    async fn tell_status(&self, gid: &str) -> Result<Value, String> {
+        Self::tell_status(self, gid).await
     }
 }
