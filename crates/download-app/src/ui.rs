@@ -399,12 +399,16 @@ pub fn validate_task_input(url: &str, file_name: &str) -> Result<(), String> {
 
 pub struct ErrorScreen {
     message: String,
+    /// Keeps the process lock until the error window closes.
+    #[allow(dead_code)]
+    instance: crate::single_instance::InstanceLock,
 }
 
 impl ErrorScreen {
-    pub fn new(message: impl Into<String>) -> Self {
+    pub fn new(message: impl Into<String>, instance: crate::single_instance::InstanceLock) -> Self {
         Self {
             message: message.into(),
+            instance,
         }
     }
 }
@@ -442,12 +446,15 @@ fn show_main_window(ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
 }
 
-pub fn run_error(message: &str) -> eframe::Result<()> {
+pub fn run_error(
+    message: &str,
+    instance: crate::single_instance::InstanceLock,
+) -> eframe::Result<()> {
     let message = message.to_string();
     eframe::run_native(
         "Download Tool",
         native_options("Download Tool", [560.0, 240.0]),
-        Box::new(move |_cc| Ok(Box::new(ErrorScreen::new(message)))),
+        Box::new(move |_cc| Ok(Box::new(ErrorScreen::new(message, instance)))),
     )
 }
 

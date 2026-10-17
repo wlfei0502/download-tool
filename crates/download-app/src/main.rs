@@ -62,9 +62,8 @@ fn try_main() -> anyhow::Result<()> {
             ui::run(app).map_err(|err| anyhow::anyhow!("open window: {err}"))?;
         }
         Err(message) => {
-            let _instance = instance;
             eprintln!("{message}");
-            if let Err(err) = ui::run_error(&message) {
+            if let Err(err) = ui::run_error(&message, instance) {
                 eprintln!("failed to open error window: {err}");
             }
             std::process::exit(1);
