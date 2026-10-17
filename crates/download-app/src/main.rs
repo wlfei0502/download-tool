@@ -1,3 +1,4 @@
+mod single_instance;
 mod tray;
 mod ui;
 
@@ -7,12 +8,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
+use axum::extract::State;
+use axum::routing::post;
+use axum::{Json, Router};
 use download_core::aria2::process::Aria2Process;
 use download_core::aria2::rpc::Aria2Client;
 use download_core::engine::DownloadEngine;
 use download_core::manager::TaskManager;
 use download_core::task::{NewTaskRequest, TaskId, TaskStatus};
 use download_local_api::{app, AppState, DEFAULT_PORT};
+use single_instance::Activation;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
 use ui::{Command, DownloadUi, SharedModel};
@@ -34,13 +39,30 @@ fn main() {
 }
 
 fn try_main() -> anyhow::Result<()> {
+    let instance = match single_instance::claim().map_err(|err| anyhow::anyhow!(err))? {
+        single_instance::Launch::Secondary => {
+            // The running process owns the window. Hand off and exit 0 even
+            // when the local API does not answer, so a second window is not opened.
+            if let Err(err) = single_instance::forward_current_args() {
+                eprintln!("could not forward to the running Download Tool: {err}");
+            }
+            return Ok(());
+        }
+        single_instance::Launch::Primary(instance) => instance,
+    };
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("start tokio runtime")?;
-    match runtime.block_on(prepare()) {
-        Ok(app) => ui::run(app).map_err(|err| anyhow::anyhow!("open window: {err}"))?,
+    let activation = Activation::new();
+    match runtime.block_on(prepare(activation)) {
+        Ok(mut app) => {
+            app.hold_instance(instance);
+            ui::run(app).map_err(|err| anyhow::anyhow!("open window: {err}"))?;
+        }
         Err(message) => {
+            let _instance = instance;
             eprintln!("{message}");
             if let Err(err) = ui::run_error(&message) {
                 eprintln!("failed to open error window: {err}");
@@ -51,7 +73,7 @@ fn try_main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn prepare() -> Result<DownloadUi, String> {
+async fn prepare(activation: Activation) -> Result<DownloadUi, String> {
     let save_dir = default_save_dir();
     let save_dir_text = save_dir.to_string_lossy().to_string();
     let tasks = Arc::new(Mutex::new(TaskManager::new()));
@@ -65,9 +87,7 @@ async fn prepare() -> Result<DownloadUi, String> {
     let listener = bind_api().await?;
     eprintln!("listening on http://127.0.0.1:{DEFAULT_PORT}");
 
-    let router = app(AppState {
-        tasks: Arc::clone(&tasks),
-    });
+    let router = api_router(Arc::clone(&tasks), activation.clone());
     let server = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
             eprintln!("local API stopped: {err}");
@@ -92,7 +112,21 @@ async fn prepare() -> Result<DownloadUi, String> {
         commands_tx,
         server,
         aria2.0.take(),
+        activation,
     ))
+}
+
+fn api_router(tasks: Arc<Mutex<TaskManager>>, activation: Activation) -> Router {
+    app(AppState { tasks }).merge(
+        Router::new()
+            .route("/v1/invoke", post(invoke))
+            .with_state(activation),
+    )
+}
+
+async fn invoke(State(activation): State<Activation>) -> Json<serde_json::Value> {
+    activation.request_show();
+    Json(serde_json::json!({ "ok": true }))
 }
 
 fn api_listen_addr() -> std::net::SocketAddr {
@@ -155,7 +189,7 @@ async fn start_backend(
                 Some(format!(
                     "aria2c is not available ({err}). Tasks can still be queued; downloads will not start."
                 )),
-            )
+            );
         }
     };
 
@@ -486,7 +520,10 @@ mod tests {
     use axum::Router;
     use download_core::aria2::rpc::Aria2Client;
 
-    use super::{api_listen_addr, bind_api, control, pause_all, retry_until_rpc_ready, Control};
+    use super::{
+        api_listen_addr, api_router, bind_api, control, pause_all, retry_until_rpc_ready, Control,
+    };
+    use crate::single_instance::Activation;
     use download_core::manager::TaskManager;
     use download_core::task::{NewTaskRequest, TaskStatus};
     use download_local_api::DEFAULT_PORT;
@@ -499,6 +536,48 @@ mod tests {
         assert!(addr.ip().is_loopback());
         assert_eq!(addr.port(), DEFAULT_PORT);
         assert_eq!(DEFAULT_PORT, 29128);
+    }
+
+    #[tokio::test]
+    async fn invoke_asks_the_existing_window_to_show() {
+        let activation = Activation::new();
+        let router = api_router(Arc::new(Mutex::new(TaskManager::new())), activation.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("invoke listener");
+        let addr = listener.local_addr().expect("invoke addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("invoke server");
+        });
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let response = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut client = std::net::TcpStream::connect(addr).expect("connect invoke");
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            client
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("write timeout");
+            client
+                .write_all(b"POST /v1/invoke HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .expect("write invoke");
+            let mut response = String::new();
+            client.read_to_string(&mut response).expect("read invoke");
+            response
+        })
+        .await
+        .expect("invoke client");
+        assert!(response.contains("200"), "{response}");
+        assert!(response.contains("\"ok\":true"), "{response}");
+        assert!(activation.take_show());
+        server.abort();
     }
 
     #[tokio::test]

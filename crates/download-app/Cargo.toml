@@ -14,6 +14,8 @@ download-core = { path = "../download-core" }
 download-local-api = { path = "../download-local-api" }
 eframe = "0.33"
 egui = "0.33"
+serde_json = "1"
+single-instance = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
 # Linux needs the system packages listed in the tray-icon README
 # (gtk3, xdotool, libappindicator or libayatana-appindicator).

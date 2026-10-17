@@ -72,6 +72,10 @@ pub struct DownloadUi {
     aria2: Option<Child>,
     tray: Option<crate::tray::Tray>,
     quit: bool,
+    activation: crate::single_instance::Activation,
+    /// Keeps the process lock until the window loop ends.
+    #[allow(dead_code)]
+    instance: Option<crate::single_instance::InstanceLock>,
 }
 
 impl DownloadUi {
@@ -82,6 +86,7 @@ impl DownloadUi {
         commands: mpsc::UnboundedSender<Command>,
         server: tokio::task::JoinHandle<()>,
         aria2: Option<Child>,
+        activation: crate::single_instance::Activation,
     ) -> Self {
         Self {
             url: String::new(),
@@ -94,6 +99,19 @@ impl DownloadUi {
             aria2,
             tray: None,
             quit: false,
+            activation,
+            instance: None,
+        }
+    }
+
+    pub fn hold_instance(&mut self, lock: crate::single_instance::InstanceLock) {
+        self.instance = Some(lock);
+    }
+
+    fn apply_activation(&mut self, ctx: &egui::Context) {
+        self.activation.bind_context(ctx);
+        if self.activation.take_show() {
+            show_main_window(ctx);
         }
     }
 
@@ -181,6 +199,7 @@ impl Drop for DownloadUi {
 impl eframe::App for DownloadUi {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(400));
+        self.apply_activation(ctx);
         self.apply_tray(ctx);
         self.handle_window_close(ctx);
         let (tasks, notice) = self.model.view();
