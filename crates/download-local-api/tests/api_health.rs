@@ -171,6 +171,68 @@ async fn post_same_url_returns_existing_task_id() {
 }
 
 #[tokio::test]
+async fn post_task_rejects_non_http_urls() {
+    let app = app(state());
+    for url in [
+        "https://example.com/d/x",
+        "HTTPS://example.com/d/x",
+        "ftp://example.com/d/x",
+        "FTP://example.com/d/x",
+    ] {
+        let body = json!({
+            "url": url,
+            "fileName": "x.bin"
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(res).await["error"],
+            "only http:// URLs are allowed"
+        );
+    }
+
+    let listed = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/tasks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(listed).await.as_array().unwrap().len(), 0);
+
+    let body = json!({
+        "url": "HTTP://example.com/d/x",
+        "fileName": "x.bin"
+    });
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn post_task_rejects_empty_url() {
     let app = app(state());
     let body = json!({

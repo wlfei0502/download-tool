@@ -278,9 +278,9 @@ async fn handle_command(
         } => {
             add_task(engine, tasks, save_dir, dir, url, file_name, model).await;
         }
-        Command::Pause(id) => control(engine, model, &id, Control::Pause).await,
-        Command::Resume(id) => control(engine, model, &id, Control::Resume).await,
-        Command::Cancel(id) => control(engine, model, &id, Control::Cancel).await,
+        Command::Pause(id) => control(engine, tasks, model, &id, Control::Pause).await,
+        Command::Resume(id) => control(engine, tasks, model, &id, Control::Resume).await,
+        Command::Cancel(id) => control(engine, tasks, model, &id, Control::Cancel).await,
     }
 }
 
@@ -358,11 +358,19 @@ enum Control {
 
 async fn control(
     engine: &mut Option<DownloadEngine<Aria2Client>>,
+    tasks: &Arc<Mutex<TaskManager>>,
     model: &SharedModel,
     id: &TaskId,
     action: Control,
 ) {
     let Some(engine) = engine.as_mut() else {
+        if let Control::Cancel = action {
+            match tasks.lock().await.remove(id) {
+                Ok(()) => model.set_notice(None),
+                Err(err) => model.set_notice(Some(err)),
+            }
+            return;
+        }
         model.set_notice(Some("aria2c is not available".into()));
         return;
     };

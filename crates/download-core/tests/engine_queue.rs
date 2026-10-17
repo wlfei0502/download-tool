@@ -158,6 +158,40 @@ fn request(url: &str, file_name: &str) -> NewTaskRequest {
 }
 
 #[tokio::test]
+async fn submit_rejects_non_http_urls_and_accepts_http() {
+    let aria = FakeAria2::default();
+    let mut engine = DownloadEngine::new(aria.clone(), "/downloads");
+
+    for url in [
+        "https://example.com/a.zip",
+        "HTTPS://example.com/a.zip",
+        "ftp://example.com/a.zip",
+        "FTP://files.example.com/a.zip",
+    ] {
+        let err = engine
+            .submit(request(url, "a.zip"))
+            .await
+            .expect_err("non-http rejected");
+        assert_eq!(err, "only http:// URLs are allowed");
+    }
+    assert!(engine.manager().await.list().is_empty());
+    assert!(aria.calls().is_empty());
+
+    let id = engine
+        .submit(request("http://example.com/a.zip", "a.zip"))
+        .await
+        .expect("http");
+    assert_eq!(task(&engine, &id).await.url, "http://example.com/a.zip");
+
+    let upper = engine
+        .submit(request("HTTP://example.com/b.zip", "b.zip"))
+        .await
+        .expect("HTTP");
+    assert_eq!(task(&engine, &upper).await.status, TaskStatus::Active);
+    assert_eq!(aria.calls().len(), 2);
+}
+
+#[tokio::test]
 async fn submit_adds_uri_stores_gid_and_marks_active() {
     let aria = FakeAria2::default();
     let mut engine = DownloadEngine::new(aria.clone(), "/downloads");
@@ -438,6 +472,56 @@ async fn pause_resume_and_cancel_call_aria2() {
             },
         ]
     );
+}
+
+#[tokio::test]
+async fn cancel_removes_queued_task_without_gid_and_allows_same_url() {
+    let tasks = Arc::new(tokio::sync::Mutex::new(TaskManager::new()));
+    let aria = FakeAria2::default();
+    let mut engine = DownloadEngine::shared(Arc::clone(&tasks), aria.clone(), "/downloads");
+    let req = request("http://example.com/a.zip", "a.zip");
+    let id = tasks.lock().await.add(req.clone()).expect("queue");
+    {
+        let manager = tasks.lock().await;
+        let queued = manager.get(&id).expect("queued");
+        assert_eq!(queued.status, TaskStatus::Queued);
+        assert!(queued.gid.is_none());
+    }
+
+    engine.cancel_task(&id).await.expect("cancel");
+    assert!(engine.manager().await.list().is_empty());
+    assert!(engine.manager().await.find_by_url(&req.url).is_none());
+    assert!(aria.calls().is_empty());
+
+    let again = engine.submit(req).await.expect("readd");
+    assert_ne!(again, id);
+    assert_eq!(engine.manager().await.list().len(), 1);
+    assert_eq!(task(&engine, &again).await.status, TaskStatus::Active);
+}
+
+#[tokio::test]
+async fn cancel_removes_error_task_without_gid_and_allows_same_url() {
+    let aria = FakeAria2::default();
+    aria.fail_next_add("rpc down");
+    let mut engine = DownloadEngine::new(aria.clone(), "/downloads");
+    let req = request("http://example.com/a.zip", "a.zip");
+
+    engine.submit(req.clone()).await.expect_err("add fails");
+    let id = {
+        let manager = engine.manager().await;
+        let stored = manager.list().pop().expect("kept");
+        assert_eq!(stored.status, TaskStatus::Error);
+        assert!(stored.gid.is_none());
+        stored.id
+    };
+
+    engine.cancel_task(&id).await.expect("cancel");
+    assert!(engine.manager().await.list().is_empty());
+    assert!(engine.manager().await.find_by_url(&req.url).is_none());
+
+    let again = engine.submit(req).await.expect("readd");
+    assert_ne!(again, id);
+    assert_eq!(task(&engine, &again).await.gid.as_deref(), Some("gid-1"));
 }
 
 #[tokio::test]

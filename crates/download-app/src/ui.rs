@@ -2,7 +2,7 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use download_core::task::{DownloadTask, TaskId, TaskStatus};
+use download_core::task::{require_http_url, DownloadTask, TaskId, TaskStatus};
 use download_local_api::DEFAULT_PORT;
 use tokio::sync::mpsc;
 
@@ -176,7 +176,7 @@ impl eframe::App for DownloadUi {
                     ui.add(
                         egui::TextEdit::singleline(&mut self.url)
                             .desired_width(520.0)
-                            .hint_text("https://example.com/file.zip"),
+                            .hint_text("http://example.com/file.zip"),
                     );
                     ui.end_row();
 
@@ -247,8 +247,7 @@ fn task_table(ui: &mut egui::Ui, tasks: &[DownloadTask], mut send: impl FnMut(Co
                     ui.horizontal(|ui| {
                         let pause = task.status == TaskStatus::Active;
                         let resume = task.status == TaskStatus::Paused;
-                        let cancel = task.gid.is_some()
-                            && matches!(task.status, TaskStatus::Active | TaskStatus::Paused);
+                        let cancel = can_cancel(task);
                         if ui.add_enabled(pause, egui::Button::new("Pause")).clicked() {
                             send(Command::Pause(task.id.clone()));
                         }
@@ -321,10 +320,15 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-pub fn validate_task_input(url: &str, file_name: &str) -> Result<(), String> {
-    if url.is_empty() {
-        return Err("url required".into());
+pub fn can_cancel(task: &DownloadTask) -> bool {
+    if task.gid.is_none() {
+        return matches!(task.status, TaskStatus::Queued | TaskStatus::Error);
     }
+    matches!(task.status, TaskStatus::Active | TaskStatus::Paused)
+}
+
+pub fn validate_task_input(url: &str, file_name: &str) -> Result<(), String> {
+    require_http_url(url)?;
     if file_name.is_empty() || file_name == "." || file_name == ".." {
         return Err("file name required".into());
     }
@@ -389,7 +393,21 @@ fn native_options(title: &str, size: [f32; 2]) -> eframe::NativeOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_bytes, validate_task_input};
+    use super::{can_cancel, format_bytes, validate_task_input};
+    use download_core::task::{DownloadTask, NewTaskRequest, TaskStatus};
+
+    fn task(status: TaskStatus, gid: Option<&str>) -> DownloadTask {
+        let mut task = DownloadTask::from_request(NewTaskRequest {
+            url: "http://example.com/a.zip".into(),
+            file_name: "a.zip".into(),
+            size: None,
+            referrer: None,
+            user_agent: None,
+        });
+        task.status = status;
+        task.gid = gid.map(str::to_string);
+        task
+    }
 
     #[test]
     fn rejects_empty_url_and_path_file_names() {
@@ -401,6 +419,35 @@ mod tests {
         assert!(validate_task_input("http://example.com/a", "../secret").is_err());
         assert!(validate_task_input("http://example.com/a", "a/b.zip").is_err());
         assert!(validate_task_input("http://example.com/a", "a.zip").is_ok());
+    }
+
+    #[test]
+    fn rejects_non_http_urls_and_accepts_http() {
+        assert_eq!(
+            validate_task_input("https://example.com/a", "a.zip").unwrap_err(),
+            "only http:// URLs are allowed"
+        );
+        assert_eq!(
+            validate_task_input("HTTPS://example.com/a", "a.zip").unwrap_err(),
+            "only http:// URLs are allowed"
+        );
+        assert_eq!(
+            validate_task_input("ftp://example.com/a", "a.zip").unwrap_err(),
+            "only http:// URLs are allowed"
+        );
+        assert!(validate_task_input("http://example.com/a", "a.zip").is_ok());
+        assert!(validate_task_input("HTTP://example.com/a", "a.zip").is_ok());
+    }
+
+    #[test]
+    fn cancel_enabled_for_queued_and_error_without_gid() {
+        assert!(can_cancel(&task(TaskStatus::Queued, None)));
+        assert!(can_cancel(&task(TaskStatus::Error, None)));
+        assert!(can_cancel(&task(TaskStatus::Active, Some("gid-1"))));
+        assert!(can_cancel(&task(TaskStatus::Paused, Some("gid-1"))));
+        assert!(!can_cancel(&task(TaskStatus::Active, None)));
+        assert!(!can_cancel(&task(TaskStatus::Complete, None)));
+        assert!(!can_cancel(&task(TaskStatus::Error, Some("gid-1"))));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::task::{DownloadTask, NewTaskRequest, TaskId, TaskStatus};
+use crate::task::{require_http_url, DownloadTask, NewTaskRequest, TaskId, TaskStatus};
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -17,9 +17,7 @@ impl TaskManager {
     /// The URL string is indexed at insert time for deduplication; it must not be changed
     /// afterward (see [`Self::get_mut`]).
     pub fn add(&mut self, req: NewTaskRequest) -> Result<TaskId, String> {
-        if req.url.is_empty() {
-            return Err("url required".into());
-        }
+        require_http_url(&req.url)?;
         if let Some(id) = self.by_url.get(&req.url) {
             return Ok(id.clone());
         }
@@ -59,5 +57,14 @@ impl TaskManager {
 
     pub fn find_by_url(&self, url: &str) -> Option<&DownloadTask> {
         self.by_url.get(url).and_then(|id| self.tasks.get(id))
+    }
+
+    /// Drops the task and its URL index entry so the same URL can be added again.
+    pub fn remove(&mut self, id: &TaskId) -> Result<(), String> {
+        if self.tasks.remove(id).is_none() {
+            return Err("task not found".into());
+        }
+        self.by_url.retain(|_, existing| existing != id);
+        Ok(())
     }
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::manager::TaskManager;
-use crate::task::{DownloadTask, NewTaskRequest, TaskId, TaskStatus};
+use crate::task::{require_http_url, DownloadTask, NewTaskRequest, TaskId, TaskStatus};
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::sync::{Mutex, MutexGuard};
@@ -59,6 +59,7 @@ impl<A: Aria2Api> DownloadEngine<A> {
     /// A previous attempt that never received a gid is started again. A task that
     /// already has a gid is left as-is.
     pub async fn submit(&mut self, req: NewTaskRequest) -> Result<TaskId, String> {
+        require_http_url(&req.url)?;
         let id = {
             let mut manager = self.manager.lock().await;
             manager.add(req)?
@@ -155,7 +156,18 @@ impl<A: Aria2Api> DownloadEngine<A> {
     }
 
     pub async fn cancel_task(&mut self, id: &TaskId) -> Result<(), String> {
-        let gid = self.gid_of(id).await?;
+        let gid = {
+            let manager = self.manager.lock().await;
+            let task = manager
+                .get(id)
+                .ok_or_else(|| "task not found".to_string())?;
+            task.gid.clone()
+        };
+        let Some(gid) = gid else {
+            let mut manager = self.manager.lock().await;
+            manager.remove(id)?;
+            return Ok(());
+        };
         self.aria2.remove(&gid).await?;
         let mut manager = self.manager.lock().await;
         let task = manager

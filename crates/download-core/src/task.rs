@@ -38,6 +38,20 @@ pub struct DownloadTask {
     pub download_speed: u64,
 }
 
+/// Download URLs must use the `http://` scheme. Comparison is case-insensitive.
+pub fn require_http_url(url: &str) -> Result<(), String> {
+    if url.is_empty() {
+        return Err("url required".into());
+    }
+    let is_http = url
+        .get(.."http://".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
+    if !is_http {
+        return Err("only http:// URLs are allowed".into());
+    }
+    Ok(())
+}
+
 impl DownloadTask {
     pub fn from_request(req: NewTaskRequest) -> Self {
         Self {
