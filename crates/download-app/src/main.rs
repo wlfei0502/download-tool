@@ -1,3 +1,4 @@
+mod tray;
 mod ui;
 
 use std::path::{Path, PathBuf};
@@ -281,6 +282,7 @@ async fn handle_command(
         Command::Pause(id) => control(engine, tasks, model, &id, Control::Pause).await,
         Command::Resume(id) => control(engine, tasks, model, &id, Control::Resume).await,
         Command::Cancel(id) => control(engine, tasks, model, &id, Control::Cancel).await,
+        Command::PauseAll => pause_all(engine, tasks, model).await,
     }
 }
 
@@ -356,6 +358,45 @@ enum Control {
     Cancel,
 }
 
+async fn pause_all(
+    engine: &mut Option<DownloadEngine<Aria2Client>>,
+    tasks: &Arc<Mutex<TaskManager>>,
+    model: &SharedModel,
+) {
+    let targets = {
+        let manager = tasks.lock().await;
+        tray::pause_all_ids(&manager.list())
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let mut first_error = None;
+    for id in targets {
+        if let Err(err) = pause_one(engine, tasks, &id).await {
+            first_error.get_or_insert(err);
+        }
+    }
+    model.set_notice(first_error);
+}
+
+async fn pause_one(
+    engine: &mut Option<DownloadEngine<Aria2Client>>,
+    tasks: &Arc<Mutex<TaskManager>>,
+    id: &TaskId,
+) -> Result<(), String> {
+    let gid = task_gid(tasks, id).await;
+    if gid.is_some() {
+        if let Some(engine) = engine.as_mut() {
+            return engine.pause_task(id).await;
+        }
+    }
+    tasks.lock().await.set_status(id, TaskStatus::Paused)
+}
+
+async fn task_gid(tasks: &Arc<Mutex<TaskManager>>, id: &TaskId) -> Option<String> {
+    tasks.lock().await.get(id).and_then(|task| task.gid.clone())
+}
+
 async fn control(
     engine: &mut Option<DownloadEngine<Aria2Client>>,
     tasks: &Arc<Mutex<TaskManager>>,
@@ -363,6 +404,16 @@ async fn control(
     id: &TaskId,
     action: Control,
 ) {
+    // A paused task that never received a gid goes back to the queue. Resume
+    // would otherwise fail with "task has no gid", so Pause all could not be undone.
+    if matches!(action, Control::Resume) && task_gid(tasks, id).await.is_none() {
+        match tasks.lock().await.set_status(id, TaskStatus::Queued) {
+            Ok(()) => model.set_notice(None),
+            Err(err) => model.set_notice(Some(err)),
+        }
+        return;
+    }
+
     let Some(engine) = engine.as_mut() else {
         if let Control::Cancel = action {
             match tasks.lock().await.remove(id) {
@@ -435,8 +486,11 @@ mod tests {
     use axum::Router;
     use download_core::aria2::rpc::Aria2Client;
 
-    use super::{api_listen_addr, bind_api, retry_until_rpc_ready};
+    use super::{api_listen_addr, bind_api, control, pause_all, retry_until_rpc_ready, Control};
+    use download_core::manager::TaskManager;
+    use download_core::task::{NewTaskRequest, TaskStatus};
     use download_local_api::DEFAULT_PORT;
+    use tokio::sync::Mutex;
 
     #[test]
     fn api_listens_on_loopback_default_port_only() {
@@ -543,5 +597,67 @@ mod tests {
         assert!(err.contains("not ready"), "{err}");
         assert_eq!(hits.load(Ordering::SeqCst), 3);
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn pause_all_without_engine_pauses_open_tasks_and_resume_requeues() {
+        let tasks = Arc::new(Mutex::new(TaskManager::new()));
+        let queued = tasks
+            .lock()
+            .await
+            .add(request("http://example.com/queued.zip", "queued.zip"))
+            .expect("queue");
+        let active = tasks
+            .lock()
+            .await
+            .add(request("http://example.com/active.zip", "active.zip"))
+            .expect("active");
+        {
+            let mut manager = tasks.lock().await;
+            manager
+                .set_status(&active, TaskStatus::Active)
+                .expect("mark active");
+            let done = manager
+                .add(request("http://example.com/done.zip", "done.zip"))
+                .expect("done");
+            manager
+                .set_status(&done, TaskStatus::Complete)
+                .expect("mark complete");
+        }
+
+        let model = crate::ui::SharedModel::new();
+        let mut engine = None;
+        pause_all(&mut engine, &tasks, &model).await;
+
+        let manager = tasks.lock().await;
+        assert_eq!(
+            manager.get(&queued).expect("queued").status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            manager.get(&active).expect("active").status,
+            TaskStatus::Paused
+        );
+        assert!(manager
+            .list()
+            .iter()
+            .any(|task| task.status == TaskStatus::Complete));
+        drop(manager);
+
+        control(&mut engine, &tasks, &model, &queued, Control::Resume).await;
+        assert_eq!(
+            tasks.lock().await.get(&queued).expect("requeued").status,
+            TaskStatus::Queued
+        );
+    }
+
+    fn request(url: &str, file_name: &str) -> NewTaskRequest {
+        NewTaskRequest {
+            url: url.into(),
+            file_name: file_name.into(),
+            size: None,
+            referrer: None,
+            user_agent: None,
+        }
     }
 }

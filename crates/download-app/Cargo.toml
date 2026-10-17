@@ -15,3 +15,7 @@ download-local-api = { path = "../download-local-api" }
 eframe = "0.33"
 egui = "0.33"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+# Linux needs the system packages listed in the tray-icon README
+# (gtk3, xdotool, libappindicator or libayatana-appindicator).
+# macOS and Windows pull their platform crates in through this dependency.
+tray-icon = "0.24"

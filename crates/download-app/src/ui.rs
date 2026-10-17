@@ -15,6 +15,7 @@ pub enum Command {
     Pause(TaskId),
     Resume(TaskId),
     Cancel(TaskId),
+    PauseAll,
     SetSaveDir(String),
 }
 
@@ -69,6 +70,8 @@ pub struct DownloadUi {
     commands: mpsc::UnboundedSender<Command>,
     server: tokio::task::JoinHandle<()>,
     aria2: Option<Child>,
+    tray: Option<crate::tray::Tray>,
+    quit: bool,
 }
 
 impl DownloadUi {
@@ -89,6 +92,41 @@ impl DownloadUi {
             commands,
             server,
             aria2,
+            tray: None,
+            quit: false,
+        }
+    }
+
+    fn install_tray(&mut self, ctx: &egui::Context) {
+        match crate::tray::Tray::install(ctx) {
+            Ok(tray) => self.tray = Some(tray),
+            Err(err) => eprintln!("system tray unavailable: {err}"),
+        }
+    }
+
+    fn apply_tray(&mut self, ctx: &egui::Context) {
+        let actions = self
+            .tray
+            .as_ref()
+            .map(|tray| tray.poll())
+            .unwrap_or_default();
+        for action in actions {
+            match action {
+                crate::tray::TrayAction::Show => show_main_window(ctx),
+                crate::tray::TrayAction::PauseAll => self.send(Command::PauseAll),
+                crate::tray::TrayAction::Quit => {
+                    self.quit = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn handle_window_close(&mut self, ctx: &egui::Context) {
+        let close_requested = ctx.input(|input| input.viewport().close_requested());
+        if close_requested && crate::tray::hide_on_close(self.tray.is_some(), self.quit) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
     }
 
@@ -143,6 +181,8 @@ impl Drop for DownloadUi {
 impl eframe::App for DownloadUi {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(400));
+        self.apply_tray(ctx);
+        self.handle_window_close(ctx);
         let (tasks, notice) = self.model.view();
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -364,12 +404,23 @@ impl eframe::App for ErrorScreen {
     }
 }
 
-pub fn run(app: DownloadUi) -> eframe::Result<()> {
+pub fn run(mut app: DownloadUi) -> eframe::Result<()> {
     eframe::run_native(
         "Download Tool",
         native_options("Download Tool", [980.0, 680.0]),
-        Box::new(|_cc| Ok(Box::new(app))),
+        Box::new(move |cc| {
+            // The winit loop is already running here, which tray-icon requires
+            // before a status item is created (especially on macOS).
+            app.install_tray(&cc.egui_ctx);
+            Ok(Box::new(app))
+        }),
     )
+}
+
+fn show_main_window(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
 }
 
 pub fn run_error(message: &str) -> eframe::Result<()> {
