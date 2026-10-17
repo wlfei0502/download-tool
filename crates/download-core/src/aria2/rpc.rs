@@ -42,15 +42,12 @@ impl Aria2Client {
         if let Some(err) = v.get("error") {
             return Err(err.to_string());
         }
-        v.get("result").cloned().ok_or_else(|| "missing result".into())
+        v.get("result")
+            .cloned()
+            .ok_or_else(|| "missing result".into())
     }
 
-    pub async fn add_uri(
-        &self,
-        url: &str,
-        dir: &str,
-        out: &str,
-    ) -> Result<String, String> {
+    pub async fn add_uri(&self, url: &str, dir: &str, out: &str) -> Result<String, String> {
         let options = json!({ "dir": dir, "out": out });
         let result = self
             .call("aria2.addUri", vec![json!([url]), options])
@@ -66,11 +63,19 @@ impl Aria2Client {
     }
 
     pub async fn unpause(&self, gid: &str) -> Result<(), String> {
-        self.call("aria2.unpause", vec![json!(gid)]).await.map(|_| ())
+        self.call("aria2.unpause", vec![json!(gid)])
+            .await
+            .map(|_| ())
     }
 
     pub async fn remove(&self, gid: &str) -> Result<(), String> {
-        self.call("aria2.remove", vec![json!(gid)]).await.map(|_| ())
+        self.call("aria2.remove", vec![json!(gid)])
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn get_version(&self) -> Result<Value, String> {
+        self.call("aria2.getVersion", Vec::new()).await
     }
 
     pub async fn tell_status(&self, gid: &str) -> Result<Value, String> {
