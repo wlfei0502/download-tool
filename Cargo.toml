@@ -1,3 +1,7 @@
 [workspace]
 resolver = "2"
-members = ["crates/download-core", "crates/download-local-api"]
+members = [
+    "crates/download-core",
+    "crates/download-local-api",
+    "crates/download-app",
+]

@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use download_core::engine::{Aria2Api, DownloadEngine};
-use download_core::task::{NewTaskRequest, TaskId, TaskStatus};
+use download_core::manager::TaskManager;
+use download_core::task::{DownloadTask, NewTaskRequest, TaskId, TaskStatus};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,6 +143,10 @@ impl Aria2Api for FakeAria2 {
     }
 }
 
+async fn task(engine: &DownloadEngine<FakeAria2>, id: &TaskId) -> DownloadTask {
+    engine.manager().await.get(id).cloned().expect("task")
+}
+
 fn request(url: &str, file_name: &str) -> NewTaskRequest {
     NewTaskRequest {
         url: url.into(),
@@ -170,7 +175,7 @@ async fn submit_adds_uri_stores_gid_and_marks_active() {
             out: "a.zip".into(),
         }]
     );
-    let task = engine.manager().get(&id).expect("task");
+    let task = task(&engine, &id).await;
     assert_eq!(task.status, TaskStatus::Active);
     assert_eq!(task.gid.as_deref(), Some("gid-1"));
     assert_eq!(task.completed_length, 0);
@@ -207,7 +212,7 @@ async fn submit_same_url_reuses_task_without_second_add() {
     let second = engine.submit(req).await.expect("second");
 
     assert_eq!(first, second);
-    assert_eq!(engine.manager().list().len(), 1);
+    assert_eq!(engine.manager().await.list().len(), 1);
     assert_eq!(aria.calls().len(), 1);
 }
 
@@ -221,7 +226,7 @@ async fn submit_retries_add_uri_when_previous_attempt_has_no_gid() {
     engine.submit(req.clone()).await.expect_err("first");
     let id = engine.submit(req).await.expect("retry");
 
-    let task = engine.manager().get(&id).expect("task");
+    let task = task(&engine, &id).await;
     assert_eq!(task.status, TaskStatus::Active);
     assert_eq!(task.gid.as_deref(), Some("gid-1"));
     assert!(task.error.is_none());
@@ -240,7 +245,7 @@ async fn submit_marks_error_when_add_uri_fails() {
         .expect_err("add fails");
 
     assert_eq!(err, "rpc down");
-    let task = engine.manager().list().pop().expect("task kept");
+    let task = engine.manager().await.list().pop().expect("task kept");
     assert_eq!(task.status, TaskStatus::Error);
     assert_eq!(task.error.as_deref(), Some("rpc down"));
     assert!(task.gid.is_none());
@@ -267,7 +272,7 @@ async fn poll_once_updates_progress_for_active_tasks() {
 
     engine.poll_once().await.expect("poll");
 
-    let task = engine.manager().get(&id).expect("task");
+    let task = task(&engine, &id).await;
     assert_eq!(task.status, TaskStatus::Active);
     assert_eq!(task.completed_length, 40);
     assert_eq!(task.download_speed, 10);
@@ -322,19 +327,19 @@ async fn poll_once_applies_terminal_and_waiting_states() {
 
     engine.poll_once().await.expect("poll");
 
-    let complete = engine.manager().get(&complete_id).expect("complete");
+    let complete = task(&engine, &complete_id).await;
     assert_eq!(complete.status, TaskStatus::Complete);
     assert_eq!(complete.completed_length, 100);
     assert_eq!(complete.download_speed, 0);
     assert!(complete.error.is_none());
 
-    let failed = engine.manager().get(&error_id).expect("error");
+    let failed = task(&engine, &error_id).await;
     assert_eq!(failed.status, TaskStatus::Error);
     assert_eq!(failed.error.as_deref(), Some("not found"));
     assert_eq!(failed.completed_length, 3);
     assert_eq!(failed.download_speed, 0);
 
-    let waiting = engine.manager().get(&waiting_id).expect("waiting");
+    let waiting = task(&engine, &waiting_id).await;
     assert_eq!(waiting.status, TaskStatus::Active);
     assert_eq!(waiting.download_speed, 0);
 
@@ -377,11 +382,11 @@ async fn poll_once_records_rpc_error_and_continues() {
 
     engine.poll_once().await.expect("poll continues");
 
-    let broken_task = engine.manager().get(&broken).expect("broken");
+    let broken_task = task(&engine, &broken).await;
     assert_eq!(broken_task.status, TaskStatus::Error);
     assert_eq!(broken_task.error.as_deref(), Some("tell failed"));
 
-    let healthy_task = engine.manager().get(&healthy).expect("healthy");
+    let healthy_task = task(&engine, &healthy).await;
     assert_eq!(healthy_task.status, TaskStatus::Active);
     assert_eq!(healthy_task.completed_length, 8);
     assert_eq!(healthy_task.download_speed, 2);
@@ -397,10 +402,7 @@ async fn pause_resume_and_cancel_call_aria2() {
         .expect("submit");
 
     engine.pause_task(&id).await.expect("pause");
-    assert_eq!(
-        engine.manager().get(&id).unwrap().status,
-        TaskStatus::Paused
-    );
+    assert_eq!(task(&engine, &id).await.status, TaskStatus::Paused);
 
     engine.poll_once().await.expect("poll while paused");
     assert!(!aria
@@ -409,13 +411,10 @@ async fn pause_resume_and_cancel_call_aria2() {
         .any(|call| matches!(call, Call::TellStatus { .. })));
 
     engine.resume_task(&id).await.expect("resume");
-    assert_eq!(
-        engine.manager().get(&id).unwrap().status,
-        TaskStatus::Active
-    );
+    assert_eq!(task(&engine, &id).await.status, TaskStatus::Active);
 
     engine.cancel_task(&id).await.expect("cancel");
-    let task = engine.manager().get(&id).unwrap();
+    let task = task(&engine, &id).await;
     assert_eq!(task.status, TaskStatus::Error);
     assert_eq!(task.error.as_deref(), Some("cancelled"));
     assert_eq!(task.download_speed, 0);
@@ -459,4 +458,28 @@ async fn control_methods_reject_unknown_task() {
         engine.cancel_task(&missing).await.unwrap_err(),
         "task not found"
     );
+}
+
+#[tokio::test]
+async fn shared_manager_submit_starts_task_added_elsewhere() {
+    let tasks = Arc::new(tokio::sync::Mutex::new(TaskManager::new()));
+    let id = tasks
+        .lock()
+        .await
+        .add(request("http://example.com/a.zip", "a.zip"))
+        .expect("queue");
+    let aria = FakeAria2::default();
+    let mut engine = DownloadEngine::shared(Arc::clone(&tasks), aria.clone(), "/downloads");
+
+    let submitted = engine
+        .submit(request("http://example.com/a.zip", "a.zip"))
+        .await
+        .expect("submit");
+
+    assert_eq!(submitted, id);
+    let stored = tasks.lock().await.get(&id).cloned().expect("shared task");
+    assert_eq!(stored.status, TaskStatus::Active);
+    assert_eq!(stored.gid.as_deref(), Some("gid-1"));
+    assert_eq!(engine.tasks().lock().await.list().len(), 1);
+    assert_eq!(aria.calls().len(), 1);
 }

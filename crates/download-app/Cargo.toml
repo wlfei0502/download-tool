@@ -1,0 +1,17 @@
+[package]
+name = "download-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "download-tool"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+download-core = { path = "../download-core" }
+download-local-api = { path = "../download-local-api" }
+eframe = "0.33"
+egui = "0.33"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
