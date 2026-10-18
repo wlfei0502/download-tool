@@ -80,3 +80,135 @@ pub fn register(exe: &Path) -> Result<(), String> {
         Err(format!("lsregister exited with {status}. {BUNDLE_NOTE}"))
     }
 }
+
+#[cfg(any(target_os = "macos", test))]
+pub const LAUNCH_AGENT_LABEL: &str = "com.download-tool.autostart";
+
+#[cfg(any(target_os = "macos", test))]
+pub fn launch_agent_path(home: &Path) -> PathBuf {
+    home.join("Library/LaunchAgents")
+        .join(format!("{LAUNCH_AGENT_LABEL}.plist"))
+}
+
+/// Launch Agent that starts this executable at graphical login.
+#[cfg(any(target_os = "macos", test))]
+pub fn launch_agent_plist(exe: &Path) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n\
+         \t<key>Label</key>\n\
+         \t<string>{label}</string>\n\
+         \t<key>ProgramArguments</key>\n\
+         \t<array>\n\
+         \t\t<string>{program}</string>\n\
+         \t</array>\n\
+         \t<key>RunAtLoad</key>\n\
+         \t<true/>\n\
+         \t<key>LimitLoadToSessionType</key>\n\
+         \t<string>Aqua</string>\n\
+         </dict>\n\
+         </plist>\n",
+        label = LAUNCH_AGENT_LABEL,
+        program = xml_escape(&exe.display().to_string()),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(target_os = "macos")]
+pub fn set_autostart(enabled: bool, exe: &Path) -> Result<(), String> {
+    let home = std::env::var_os("HOME").ok_or_else(|| "HOME is not set".to_string())?;
+    let path = launch_agent_path(Path::new(&home));
+    if !enabled {
+        if path.exists() {
+            let _ = launchctl_bootout();
+            std::fs::remove_file(&path)
+                .map_err(|err| format!("remove {}: {err}", path.display()))?;
+        }
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("create {}: {err}", parent.display()))?;
+    }
+    let plist = launch_agent_plist(exe);
+    let current = std::fs::read_to_string(&path).ok();
+    let unchanged = current.as_deref() == Some(plist.as_str());
+    if !unchanged {
+        std::fs::write(&path, &plist).map_err(|err| format!("write {}: {err}", path.display()))?;
+    }
+    // A loaded job with the same plist is already the login item. Reloading
+    // it would start a second process because RunAtLoad is set.
+    if unchanged && launch_agent_loaded() {
+        return Ok(());
+    }
+    let _ = launchctl_bootout();
+    let uid = user_id()?;
+    let status = Command::new("launchctl")
+        .arg("bootstrap")
+        .arg(format!("gui/{uid}"))
+        .arg(&path)
+        .status()
+        .map_err(|err| format!("launchctl bootstrap: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "launchctl bootstrap exited with {status}; wrote {}",
+            path.display()
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launch_agent_loaded() -> bool {
+    let Ok(uid) = user_id() else {
+        return false;
+    };
+    Command::new("launchctl")
+        .args(["print", &format!("gui/{uid}/{LAUNCH_AGENT_LABEL}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl_bootout() -> Result<(), String> {
+    let uid = user_id()?;
+    let status = Command::new("launchctl")
+        .args(["bootout", &format!("gui/{uid}/{LAUNCH_AGENT_LABEL}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|err| format!("launchctl bootout: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("launchctl bootout exited with {status}"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn user_id() -> Result<String, String> {
+    let output = Command::new("id")
+        .arg("-u")
+        .output()
+        .map_err(|err| format!("id -u: {err}"))?;
+    if !output.status.success() {
+        return Err(format!("id -u exited with {}", output.status));
+    }
+    let id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!("id -u returned {id:?}"));
+    }
+    Ok(id)
+}

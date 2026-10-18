@@ -49,8 +49,18 @@ impl Aria2Client {
             .ok_or_else(|| "missing result".into())
     }
 
-    pub async fn add_uri(&self, url: &str, dir: &str, out: &str) -> Result<String, String> {
-        let options = json!({ "dir": dir, "out": out });
+    pub async fn add_uri(
+        &self,
+        url: &str,
+        dir: &str,
+        out: &str,
+        max_connections: u8,
+    ) -> Result<String, String> {
+        let options = json!({
+            "dir": dir,
+            "out": out,
+            "max-connection-per-server": max_connections.to_string(),
+        });
         let result = self
             .call("aria2.addUri", vec![json!([url]), options])
             .await?;
@@ -58,6 +68,21 @@ impl Aria2Client {
             .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| "gid not string".into())
+    }
+
+    /// `aria2.changeGlobalOption` / `max-overall-download-limit`.
+    /// `None` is sent as `"0"` (unlimited).
+    pub async fn set_max_overall_download_limit(
+        &self,
+        limit_bps: Option<u64>,
+    ) -> Result<(), String> {
+        let limit = limit_bps.unwrap_or(0).to_string();
+        self.call(
+            "aria2.changeGlobalOption",
+            vec![json!({ "max-overall-download-limit": limit })],
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn pause(&self, gid: &str) -> Result<(), String> {
@@ -101,8 +126,14 @@ impl Aria2Client {
 #[async_trait]
 impl Aria2Api for Aria2Client {
     // `Self::…` is the inherent RPC method. Calling the trait method would recurse.
-    async fn add_uri(&self, url: &str, dir: &str, out: &str) -> Result<String, String> {
-        Self::add_uri(self, url, dir, out).await
+    async fn add_uri(
+        &self,
+        url: &str,
+        dir: &str,
+        out: &str,
+        max_connections: u8,
+    ) -> Result<String, String> {
+        Self::add_uri(self, url, dir, out, max_connections).await
     }
 
     async fn pause(&self, gid: &str) -> Result<(), String> {
@@ -119,5 +150,9 @@ impl Aria2Api for Aria2Client {
 
     async fn tell_status(&self, gid: &str) -> Result<Value, String> {
         Self::tell_status(self, gid).await
+    }
+
+    async fn set_max_overall_download_limit(&self, limit_bps: Option<u64>) -> Result<(), String> {
+        Self::set_max_overall_download_limit(self, limit_bps).await
     }
 }

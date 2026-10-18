@@ -1,7 +1,7 @@
-//! Register `dltool://` with the operating system.
+//! Register `dltool://` and the login item with the operating system.
 //!
-//! Registration is best-effort. A missing bundle, registry, or `xdg-mime`
-//! must not stop the app from starting.
+//! Registration is best-effort. A missing bundle, registry, `xdg-mime`, or
+//! login-item hook must not stop the app from starting.
 
 use std::path::Path;
 
@@ -27,6 +27,30 @@ pub fn register_protocol(exe: &Path) -> Result<(), String> {
     {
         let _ = exe;
         Err("dltool protocol registration is not implemented for this OS".into())
+    }
+}
+
+/// Best-effort login item for the current OS.
+///
+/// The settings flag is the source of truth. This only registers or removes
+/// the platform hook. A failure here must not stop the app from starting.
+pub fn set_autostart(enabled: bool, exe: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        windows::set_autostart(enabled, exe)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::set_autostart(enabled, exe)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::set_autostart(enabled, exe)
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (enabled, exe);
+        Err("autostart is not implemented for this OS".into())
     }
 }
 
@@ -110,6 +134,66 @@ mod tests {
             Some(Path::new("/Applications/Download Tool.app").to_path_buf())
         );
         assert_eq!(macos::app_bundle(Path::new("/tmp/download-tool")), None);
+    }
+
+    #[test]
+    fn macos_launch_agent_runs_this_executable_at_login() {
+        let plist = macos::launch_agent_plist(Path::new(
+            "/Applications/Download Tool.app/Contents/MacOS/download-tool",
+        ));
+        assert!(plist.contains("com.download-tool.autostart"), "{plist}");
+        assert!(plist.contains("<key>RunAtLoad</key>"), "{plist}");
+        assert!(
+            plist.contains(
+                "<string>/Applications/Download Tool.app/Contents/MacOS/download-tool</string>"
+            ),
+            "{plist}"
+        );
+        let escaped = macos::launch_agent_plist(Path::new("/tmp/a&b<c>"));
+        assert!(escaped.contains("/tmp/a&amp;b&lt;c&gt;"), "{escaped}");
+        assert_eq!(
+            macos::launch_agent_path(Path::new("/Users/me")),
+            Path::new("/Users/me/Library/LaunchAgents/com.download-tool.autostart.plist")
+        );
+    }
+
+    #[test]
+    fn linux_autostart_desktop_file_is_enabled() {
+        let text = linux::autostart_entry(Path::new("/usr/local/bin/download-tool"));
+        assert!(
+            text.contains("Exec=/usr/local/bin/download-tool\n"),
+            "{text}"
+        );
+        assert!(text.contains("X-GNOME-Autostart-enabled=true"), "{text}");
+        assert_eq!(linux::AUTOSTART_FILE_NAME, "download-tool.desktop");
+
+        let quoted = linux::autostart_entry(Path::new("/home/me/My Apps/download-tool"));
+        assert!(
+            quoted.contains("Exec=\"/home/me/My Apps/download-tool\"\n"),
+            "{quoted}"
+        );
+
+        let xdg = linux::autostart_dir_from(Some(Path::new("/tmp/xdg")), None).unwrap();
+        assert_eq!(xdg, Path::new("/tmp/xdg/autostart"));
+        let home = linux::autostart_dir_from(None, Some(Path::new("/home/me"))).unwrap();
+        assert_eq!(home, Path::new("/home/me/.config/autostart"));
+        let err = linux::autostart_dir_from(None, None).unwrap_err();
+        assert!(err.contains("HOME"), "{err}");
+    }
+
+    #[test]
+    fn windows_run_key_quotes_the_executable() {
+        assert_eq!(
+            windows::run_value(Path::new(
+                r"C:\Program Files\Download Tool\download-tool.exe"
+            )),
+            r#""C:\Program Files\Download Tool\download-tool.exe""#
+        );
+        assert_eq!(
+            windows::RUN_KEY,
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+        );
+        assert_eq!(windows::RUN_VALUE_NAME, "Download Tool");
     }
 
     #[cfg(target_os = "macos")]

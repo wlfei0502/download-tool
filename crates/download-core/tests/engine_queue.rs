@@ -13,6 +13,10 @@ enum Call {
         url: String,
         dir: String,
         out: String,
+        max_connections: u8,
+    },
+    GlobalSpeedLimit {
+        max_overall_download_limit: String,
     },
     Pause {
         gid: String,
@@ -70,12 +74,19 @@ impl FakeAria2 {
 
 #[async_trait]
 impl Aria2Api for FakeAria2 {
-    async fn add_uri(&self, url: &str, dir: &str, out: &str) -> Result<String, String> {
+    async fn add_uri(
+        &self,
+        url: &str,
+        dir: &str,
+        out: &str,
+        max_connections: u8,
+    ) -> Result<String, String> {
         let mut inner = self.inner.lock().expect("fake lock");
         inner.calls.push(Call::AddUri {
             url: url.to_string(),
             dir: dir.to_string(),
             out: out.to_string(),
+            max_connections,
         });
         if let Some(message) = inner.fail_add.take() {
             return Err(message);
@@ -140,6 +151,17 @@ impl Aria2Api for FakeAria2 {
             .get(gid)
             .cloned()
             .ok_or_else(|| format!("unknown gid {gid}"))
+    }
+
+    async fn set_max_overall_download_limit(&self, limit_bps: Option<u64>) -> Result<(), String> {
+        self.inner
+            .lock()
+            .expect("fake lock")
+            .calls
+            .push(Call::GlobalSpeedLimit {
+                max_overall_download_limit: limit_bps.unwrap_or(0).to_string(),
+            });
+        Ok(())
     }
 }
 
@@ -207,6 +229,7 @@ async fn submit_adds_uri_stores_gid_and_marks_active() {
             url: "http://example.com/a.zip".into(),
             dir: "/downloads".into(),
             out: "a.zip".into(),
+            max_connections: 8,
         }]
     );
     let task = task(&engine, &id).await;
@@ -232,6 +255,7 @@ async fn submit_uses_updated_save_dir() {
             url: "http://example.com/b.bin".into(),
             dir: "/other".into(),
             out: "b.bin".into(),
+            max_connections: 8,
         }]
     );
 }
@@ -460,6 +484,7 @@ async fn pause_resume_and_cancel_call_aria2() {
                 url: "http://example.com/a.zip".into(),
                 dir: "/downloads".into(),
                 out: "a.zip".into(),
+                max_connections: 8,
             },
             Call::Pause {
                 gid: "gid-1".into()
@@ -566,4 +591,53 @@ async fn shared_manager_submit_starts_task_added_elsewhere() {
     assert_eq!(stored.gid.as_deref(), Some("gid-1"));
     assert_eq!(engine.tasks().lock().await.list().len(), 1);
     assert_eq!(aria.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn speed_limit_is_sent_as_max_overall_download_limit() {
+    let aria = FakeAria2::default();
+    let engine = DownloadEngine::new(aria.clone(), "/downloads");
+
+    engine
+        .set_global_speed_limit(Some(1_048_576))
+        .await
+        .expect("limit");
+    engine
+        .set_global_speed_limit(None)
+        .await
+        .expect("unlimited");
+
+    assert_eq!(
+        aria.calls(),
+        vec![
+            Call::GlobalSpeedLimit {
+                max_overall_download_limit: "1048576".into(),
+            },
+            Call::GlobalSpeedLimit {
+                max_overall_download_limit: "0".into(),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn submit_passes_max_connections_per_server() {
+    let aria = FakeAria2::default();
+    let mut engine = DownloadEngine::new(aria.clone(), "/downloads");
+    engine.set_max_connections_per_server(4);
+
+    engine
+        .submit(request("http://example.com/a.zip", "a.zip"))
+        .await
+        .expect("submit");
+
+    assert_eq!(
+        aria.calls(),
+        vec![Call::AddUri {
+            url: "http://example.com/a.zip".into(),
+            dir: "/downloads".into(),
+            out: "a.zip".into(),
+            max_connections: 4,
+        }]
+    );
 }

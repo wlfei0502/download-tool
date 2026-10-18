@@ -16,6 +16,7 @@ use download_core::aria2::process::Aria2Process;
 use download_core::aria2::rpc::Aria2Client;
 use download_core::engine::DownloadEngine;
 use download_core::manager::TaskManager;
+use download_core::settings::Settings;
 use download_core::task::{NewTaskRequest, TaskId, TaskStatus};
 use download_local_api::{app, AppState, DEFAULT_PORT};
 use single_instance::Activation;
@@ -83,10 +84,12 @@ fn try_main() -> anyhow::Result<()> {
 }
 
 async fn prepare(activation: Activation) -> Result<DownloadUi, String> {
-    let save_dir = default_save_dir();
-    let save_dir_text = save_dir.to_string_lossy().to_string();
+    let stored = load_settings();
+    if let Err(err) = sync_autostart(stored.values.autostart) {
+        eprintln!("autostart was not updated: {err}");
+    }
     let tasks = Arc::new(Mutex::new(TaskManager::new()));
-    let (child, mut engine, banner) = start_backend(&save_dir, Arc::clone(&tasks)).await;
+    let (child, mut engine, banner) = start_backend(&stored.values, Arc::clone(&tasks)).await;
     if let Some(banner) = &banner {
         eprintln!("{banner}");
     }
@@ -112,17 +115,17 @@ async fn prepare(activation: Activation) -> Result<DownloadUi, String> {
         single_instance::requests_from_args(&startup),
     )
     .await;
-    let engine_dir = save_dir_text.clone();
+    let settings_for_ui = stored.values.clone();
     tokio::spawn(run_engine(
         engine,
         tasks,
         commands_rx,
         model.clone(),
-        engine_dir,
+        stored,
     ));
 
     Ok(DownloadUi::new(
-        save_dir_text,
+        settings_for_ui,
         banner,
         model,
         commands_tx,
@@ -173,13 +176,14 @@ impl Drop for StopChild {
 }
 
 async fn start_backend(
-    save_dir: &Path,
+    settings: &Settings,
     tasks: Arc<Mutex<TaskManager>>,
 ) -> (
     Option<Child>,
     Option<DownloadEngine<Aria2Client>>,
     Option<String>,
 ) {
+    let save_dir = Path::new(&settings.save_dir);
     if let Err(err) = std::fs::create_dir_all(save_dir) {
         return (
             None,
@@ -196,7 +200,12 @@ async fn start_backend(
         Err(err) => return (None, None, Some(format!("aria2c skipped: {err}"))),
     };
     let secret = rpc_secret();
-    let (mut child, client) = match Aria2Process::start(port, &secret, save_dir) {
+    let (mut child, client) = match Aria2Process::start(
+        port,
+        &secret,
+        save_dir,
+        settings.max_connections_per_server,
+    ) {
         Ok(started) => started,
         Err(err) => {
             return (
@@ -222,7 +231,20 @@ async fn start_backend(
     }
 
     eprintln!("aria2 JSON-RPC ready on 127.0.0.1:{port}");
-    let engine = DownloadEngine::shared(tasks, client, save_dir.to_string_lossy());
+    let mut engine = DownloadEngine::shared(tasks, client, save_dir.to_string_lossy());
+    engine.set_max_connections_per_server(settings.max_connections_per_server);
+    if let Err(err) = engine
+        .set_global_speed_limit(settings.global_speed_limit_bps)
+        .await
+    {
+        return (
+            Some(child),
+            Some(engine),
+            Some(format!(
+                "global speed limit was not applied ({err}). Downloads will run without that limit."
+            )),
+        );
+    }
     (Some(child), Some(engine), None)
 }
 
@@ -270,6 +292,69 @@ async fn retry_until_rpc_ready(
     Err(last_error)
 }
 
+struct StoredSettings {
+    values: Settings,
+    path: Option<PathBuf>,
+}
+
+impl StoredSettings {
+    fn save(&self) -> Result<(), String> {
+        match &self.path {
+            Some(path) => self.values.save(path),
+            None => Ok(()),
+        }
+    }
+}
+
+fn load_settings() -> StoredSettings {
+    let path = match Settings::config_file() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("could not resolve settings path: {err}");
+            return StoredSettings {
+                values: with_default_save_dir(Settings::default()),
+                path: None,
+            };
+        }
+    };
+    let existed = path.is_file();
+    match Settings::load(&path) {
+        Ok(loaded) => {
+            let stored = StoredSettings {
+                values: with_default_save_dir(loaded.clone()),
+                path: Some(path),
+            };
+            if !existed || stored.values != loaded {
+                if let Err(err) = stored.save() {
+                    eprintln!("could not save settings: {err}");
+                }
+            }
+            stored
+        }
+        Err(err) => {
+            eprintln!("could not load settings {}: {err}", path.display());
+            // Keep the path so a later edit can replace the corrupt file.
+            // Do not overwrite it during startup.
+            StoredSettings {
+                values: with_default_save_dir(Settings::default()),
+                path: Some(path),
+            }
+        }
+    }
+}
+
+fn with_default_save_dir(mut settings: Settings) -> Settings {
+    if settings.save_dir.trim().is_empty() {
+        settings.save_dir = default_save_dir().to_string_lossy().into_owned();
+    }
+    settings
+}
+
+fn sync_autostart(enabled: bool) -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|err| format!("current executable: {err}"))?;
+    platform::set_autostart(enabled, &exe)
+}
+
 fn default_save_dir() -> PathBuf {
     if let Some(home) = std::env::var_os("HOME") {
         let downloads = PathBuf::from(home).join("Downloads");
@@ -285,7 +370,7 @@ async fn run_engine(
     tasks: Arc<Mutex<TaskManager>>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     model: SharedModel,
-    mut save_dir: String,
+    mut stored: StoredSettings,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -295,12 +380,12 @@ async fn run_engine(
                 let Some(command) = command else {
                     break;
                 };
-                handle_command(&mut engine, &tasks, &mut save_dir, command, &model).await;
+                handle_command(&mut engine, &tasks, &mut stored, command, &model).await;
                 publish(&tasks, &model).await;
             }
             _ = ticker.tick() => {
                 if let Some(engine) = engine.as_mut() {
-                    start_queued(engine, &save_dir, &model).await;
+                    start_queued(engine, &stored.values.save_dir, &model).await;
                     if let Err(err) = engine.poll_once().await {
                         model.set_notice(Some(err));
                     }
@@ -314,20 +399,20 @@ async fn run_engine(
 async fn handle_command(
     engine: &mut Option<DownloadEngine<Aria2Client>>,
     tasks: &Arc<Mutex<TaskManager>>,
-    save_dir: &mut String,
+    stored: &mut StoredSettings,
     command: Command,
     model: &SharedModel,
 ) {
     match command {
-        Command::SetSaveDir(dir) => {
-            apply_save_dir(engine, save_dir, &dir, model);
+        Command::UpdateSettings(next) => {
+            apply_settings(engine, stored, next, model).await;
         }
         Command::Add {
             url,
             file_name,
             save_dir: dir,
         } => {
-            add_task(engine, tasks, save_dir, dir, url, file_name, model).await;
+            add_task(engine, tasks, stored, dir, url, file_name, model).await;
         }
         Command::Pause(id) => control(engine, tasks, model, &id, Control::Pause).await,
         Command::Resume(id) => control(engine, tasks, model, &id, Control::Resume).await,
@@ -336,30 +421,49 @@ async fn handle_command(
     }
 }
 
-fn apply_save_dir(
+async fn apply_settings(
     engine: &mut Option<DownloadEngine<Aria2Client>>,
-    save_dir: &mut String,
-    dir: &str,
+    stored: &mut StoredSettings,
+    next: Settings,
     model: &SharedModel,
 ) {
-    if dir.is_empty() {
+    let next = next.normalized();
+    if next.save_dir.trim().is_empty() {
         model.set_notice(Some("save directory required".into()));
         return;
     }
-    if let Err(err) = std::fs::create_dir_all(dir) {
+    if let Err(err) = std::fs::create_dir_all(&next.save_dir) {
         model.set_notice(Some(format!("cannot create save directory: {err}")));
         return;
     }
-    *save_dir = dir.to_string();
-    if let Some(engine) = engine.as_mut() {
-        engine.set_save_dir(dir);
+    let autostart_changed = stored.values.autostart != next.autostart;
+    stored.values = next;
+    let mut notice = None;
+    if let Err(err) = stored.save() {
+        notice = Some(format!("could not save settings: {err}"));
     }
+    if let Some(engine) = engine.as_mut() {
+        engine.set_save_dir(&stored.values.save_dir);
+        engine.set_max_connections_per_server(stored.values.max_connections_per_server);
+        if let Err(err) = engine
+            .set_global_speed_limit(stored.values.global_speed_limit_bps)
+            .await
+        {
+            notice = Some(format!("speed limit was not applied: {err}"));
+        }
+    }
+    if autostart_changed {
+        if let Err(err) = sync_autostart(stored.values.autostart) {
+            notice = Some(format!("autostart was not updated: {err}"));
+        }
+    }
+    model.set_notice(notice);
 }
 
 async fn add_task(
     engine: &mut Option<DownloadEngine<Aria2Client>>,
     tasks: &Arc<Mutex<TaskManager>>,
-    save_dir: &mut String,
+    stored: &mut StoredSettings,
     dir: String,
     url: String,
     file_name: String,
@@ -380,24 +484,27 @@ async fn add_task(
         referrer: None,
         user_agent: None,
     };
-    let Some(engine) = engine.as_mut() else {
-        *save_dir = dir;
-        match tasks.lock().await.add(request) {
-            Ok(_) => model.set_notice(Some(
-                "Queued. aria2c is not available, so the download has not started.".into(),
-            )),
-            Err(err) => model.set_notice(Some(err)),
-        }
-        return;
-    };
     if let Err(err) = std::fs::create_dir_all(&dir) {
         model.set_notice(Some(format!("cannot create save directory: {err}")));
         return;
     }
-    *save_dir = dir.clone();
+    stored.values.save_dir = dir.clone();
+    let save_error = stored
+        .save()
+        .err()
+        .map(|err| format!("could not save settings: {err}"));
+    let Some(engine) = engine.as_mut() else {
+        match tasks.lock().await.add(request) {
+            Ok(_) => model.set_notice(Some(save_error.unwrap_or_else(|| {
+                "Queued. aria2c is not available, so the download has not started.".into()
+            }))),
+            Err(err) => model.set_notice(Some(err)),
+        }
+        return;
+    };
     engine.set_save_dir(&dir);
     match engine.submit(request).await {
-        Ok(_) => model.set_notice(None),
+        Ok(_) => model.set_notice(save_error),
         Err(err) => model.set_notice(Some(err)),
     }
 }
@@ -555,8 +662,8 @@ mod tests {
     use download_core::aria2::rpc::Aria2Client;
 
     use super::{
-        api_listen_addr, api_router, bind_api, control, enqueue_requests, pause_all,
-        retry_until_rpc_ready, Control,
+        api_listen_addr, api_router, apply_settings, bind_api, control, enqueue_requests,
+        pause_all, retry_until_rpc_ready, Control, StoredSettings,
     };
     use crate::single_instance::Activation;
     use download_core::manager::TaskManager;
@@ -783,6 +890,49 @@ mod tests {
         assert_eq!(listed[0].size, Some(9));
         assert_eq!(listed[1].file_name, "plain.bin");
         assert_eq!(listed[1].url, "http://example.com/plain.bin");
+    }
+
+    #[tokio::test]
+    async fn update_settings_persists_save_dir_and_speed_limit() {
+        let dir =
+            std::env::temp_dir().join(format!("download-tool-settings-app-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("settings.json");
+        let save_dir = dir.join("out");
+        let mut stored = StoredSettings {
+            values: download_core::settings::Settings {
+                save_dir: dir.join("in").to_string_lossy().into_owned(),
+                global_speed_limit_bps: None,
+                max_connections_per_server: 8,
+                autostart: false,
+            },
+            path: Some(path.clone()),
+        };
+        let model = crate::ui::SharedModel::new();
+        let mut engine = None;
+        apply_settings(
+            &mut engine,
+            &mut stored,
+            download_core::settings::Settings {
+                save_dir: save_dir.to_string_lossy().into_owned(),
+                global_speed_limit_bps: Some(2048),
+                max_connections_per_server: 4,
+                autostart: false,
+            },
+            &model,
+        )
+        .await;
+
+        let loaded = download_core::settings::Settings::load(&path).expect("load settings");
+        assert_eq!(loaded.save_dir, save_dir.to_string_lossy());
+        assert_eq!(loaded.global_speed_limit_bps, Some(2048));
+        assert_eq!(loaded.max_connections_per_server, 4);
+        assert!(!loaded.autostart);
+        assert!(save_dir.is_dir());
+        let (_, notice) = model.view();
+        assert_eq!(notice, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn request(url: &str, file_name: &str) -> NewTaskRequest {

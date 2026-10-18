@@ -1,4 +1,4 @@
-use download_core::aria2::process::{resolve_aria2c_path, Aria2Process};
+use download_core::aria2::process::{launch_args, resolve_aria2c_path, Aria2Process};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -116,7 +116,7 @@ async fn spawn_aria2_health() {
     let dir = std::env::temp_dir();
     let (child, client) = {
         let _guard = env_lock();
-        Aria2Process::start(port, "test-secret", &dir).expect("spawn aria2c")
+        Aria2Process::start(port, "test-secret", &dir, 8).expect("spawn aria2c")
     };
     let child = KillChild(child);
 
@@ -144,6 +144,26 @@ impl Drop for KillChild {
 fn ephemeral_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     listener.local_addr().expect("local addr").port()
+}
+
+#[test]
+fn launch_args_apply_the_connection_limit() {
+    let args = launch_args(6800, "secret", Path::new("/downloads"), 4);
+    assert!(args
+        .iter()
+        .any(|arg| arg == "--max-connection-per-server=4"));
+    assert!(args.iter().any(|arg| arg == "--dir=/downloads"));
+    assert!(args.iter().any(|arg| arg == "--rpc-listen-port=6800"));
+}
+
+#[test]
+fn launch_args_clamp_the_connection_limit() {
+    let low = launch_args(1, "secret", Path::new("."), 0);
+    assert!(low.iter().any(|arg| arg == "--max-connection-per-server=1"));
+    let high = launch_args(1, "secret", Path::new("."), 99);
+    assert!(high
+        .iter()
+        .any(|arg| arg == "--max-connection-per-server=16"));
 }
 
 fn rustc_host_triple() -> String {

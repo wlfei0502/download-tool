@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::manager::TaskManager;
+use crate::settings::{clamp_connections, DEFAULT_MAX_CONNECTIONS_PER_SERVER};
 use crate::task::{require_http_url, DownloadTask, NewTaskRequest, TaskId, TaskStatus};
 use async_trait::async_trait;
 use serde_json::Value;
@@ -8,22 +9,33 @@ use tokio::sync::{Mutex, MutexGuard};
 
 #[async_trait]
 pub trait Aria2Api: Send + Sync {
-    async fn add_uri(&self, url: &str, dir: &str, out: &str) -> Result<String, String>;
+    async fn add_uri(
+        &self,
+        url: &str,
+        dir: &str,
+        out: &str,
+        max_connections: u8,
+    ) -> Result<String, String>;
     async fn pause(&self, gid: &str) -> Result<(), String>;
     async fn unpause(&self, gid: &str) -> Result<(), String>;
     async fn remove(&self, gid: &str) -> Result<(), String>;
     async fn tell_status(&self, gid: &str) -> Result<Value, String>;
+    /// `aria2.changeGlobalOption` with `max-overall-download-limit`.
+    /// `None` sends `"0"`, which aria2 treats as unlimited.
+    async fn set_max_overall_download_limit(&self, limit_bps: Option<u64>) -> Result<(), String>;
 }
 
 /// Drives aria2 for start, poll, pause, resume, and cancel.
 ///
 /// The task list is shared (`Arc<Mutex<TaskManager>>`) so the local API and this
 /// engine update one queue. `save_dir` is the directory passed to `add_uri`.
-/// Persistence of that setting belongs to a later settings task.
+/// Callers persist that directory, the global speed limit, and the connection
+/// cap through `crate::settings::Settings`.
 pub struct DownloadEngine<A> {
     manager: Arc<Mutex<TaskManager>>,
     aria2: A,
     save_dir: String,
+    max_connections_per_server: u8,
 }
 
 impl<A: Aria2Api> DownloadEngine<A> {
@@ -38,6 +50,7 @@ impl<A: Aria2Api> DownloadEngine<A> {
             manager: tasks,
             aria2,
             save_dir: save_dir.into(),
+            max_connections_per_server: DEFAULT_MAX_CONNECTIONS_PER_SERVER,
         }
     }
 
@@ -52,6 +65,20 @@ impl<A: Aria2Api> DownloadEngine<A> {
 
     pub fn set_save_dir(&mut self, dir: impl Into<String>) {
         self.save_dir = dir.into();
+    }
+
+    /// Clamps to 1..=16, matching aria2's `max-connection-per-server` range.
+    pub fn set_max_connections_per_server(&mut self, value: u8) {
+        self.max_connections_per_server = clamp_connections(value);
+    }
+
+    pub fn max_connections_per_server(&self) -> u8 {
+        self.max_connections_per_server
+    }
+
+    /// Applies `max-overall-download-limit` for every download aria2 is serving.
+    pub async fn set_global_speed_limit(&self, limit_bps: Option<u64>) -> Result<(), String> {
+        self.aria2.set_max_overall_download_limit(limit_bps).await
     }
 
     /// Registers the task and starts it in aria2. The same URL returns the existing id.
@@ -82,7 +109,16 @@ impl<A: Aria2Api> DownloadEngine<A> {
                 .ok_or_else(|| "task not found".to_string())?;
             (task.url.clone(), task.file_name.clone())
         };
-        match self.aria2.add_uri(&url, &self.save_dir, &file_name).await {
+        match self
+            .aria2
+            .add_uri(
+                &url,
+                &self.save_dir,
+                &file_name,
+                self.max_connections_per_server,
+            )
+            .await
+        {
             Ok(gid) => {
                 let mut manager = self.manager.lock().await;
                 let task = manager

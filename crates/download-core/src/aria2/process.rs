@@ -88,18 +88,22 @@ pub struct Aria2Process;
 
 impl Aria2Process {
     /// Spawn `aria2c` with a localhost JSON-RPC listener and a client for that endpoint.
-    pub fn start(rpc_port: u16, secret: &str, dir: &Path) -> Result<(Child, Aria2Client), String> {
+    ///
+    /// `max_connections_per_server` is clamped to 1..=16.
+    pub fn start(
+        rpc_port: u16,
+        secret: &str,
+        dir: &Path,
+        max_connections_per_server: u8,
+    ) -> Result<(Child, Aria2Client), String> {
         let bin = resolve_aria2c_path(None)?;
         let mut command = Command::new(&bin);
-        command
-            .arg("--enable-rpc")
-            .arg(format!("--rpc-listen-port={rpc_port}"))
-            .arg(format!("--rpc-secret={secret}"))
-            .arg("--rpc-listen-all=false")
-            .arg(format!("--dir={}", dir.display()))
-            .arg("--continue=true")
-            .arg("--max-concurrent-downloads=5")
-            .arg("--max-connection-per-server=8");
+        command.args(launch_args(
+            rpc_port,
+            secret,
+            dir,
+            max_connections_per_server,
+        ));
         let child = command
             .spawn()
             .map_err(|err| format!("failed to spawn {}: {err}", bin.display()))?;
@@ -109,4 +113,24 @@ impl Aria2Process {
         );
         Ok((child, client))
     }
+}
+
+/// Arguments passed to `aria2c` besides the binary path.
+pub fn launch_args(
+    rpc_port: u16,
+    secret: &str,
+    dir: &Path,
+    max_connections_per_server: u8,
+) -> Vec<String> {
+    let connections = crate::settings::clamp_connections(max_connections_per_server);
+    vec![
+        "--enable-rpc".into(),
+        format!("--rpc-listen-port={rpc_port}"),
+        format!("--rpc-secret={secret}"),
+        "--rpc-listen-all=false".into(),
+        format!("--dir={}", dir.display()),
+        "--continue=true".into(),
+        "--max-concurrent-downloads=5".into(),
+        format!("--max-connection-per-server={connections}"),
+    ]
 }

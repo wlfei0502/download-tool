@@ -2,6 +2,7 @@ use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use download_core::settings::Settings;
 use download_core::task::{require_http_url, DownloadTask, TaskId, TaskStatus};
 use download_local_api::DEFAULT_PORT;
 use tokio::sync::mpsc;
@@ -16,7 +17,7 @@ pub enum Command {
     Resume(TaskId),
     Cancel(TaskId),
     PauseAll,
-    SetSaveDir(String),
+    UpdateSettings(Settings),
 }
 
 #[derive(Default)]
@@ -65,6 +66,9 @@ pub struct DownloadUi {
     url: String,
     file_name: String,
     save_dir: String,
+    speed_limit: String,
+    max_connections: String,
+    autostart: bool,
     banner: Option<String>,
     model: SharedModel,
     commands: mpsc::UnboundedSender<Command>,
@@ -80,7 +84,7 @@ pub struct DownloadUi {
 
 impl DownloadUi {
     pub fn new(
-        save_dir: String,
+        settings: Settings,
         banner: Option<String>,
         model: SharedModel,
         commands: mpsc::UnboundedSender<Command>,
@@ -91,7 +95,10 @@ impl DownloadUi {
         Self {
             url: String::new(),
             file_name: String::new(),
-            save_dir,
+            speed_limit: format_speed_limit_kbps(settings.global_speed_limit_bps),
+            max_connections: settings.max_connections_per_server.to_string(),
+            autostart: settings.autostart,
+            save_dir: settings.save_dir,
             banner,
             model,
             commands,
@@ -151,16 +158,14 @@ impl DownloadUi {
     fn submit_add(&mut self) {
         let url = self.url.trim().to_string();
         let file_name = self.file_name.trim().to_string();
-        let save_dir = self.save_dir.trim().to_string();
         if let Err(err) = validate_task_input(&url, &file_name) {
             self.model.set_notice(Some(err));
             return;
         }
-        if save_dir.is_empty() {
-            self.model
-                .set_notice(Some("save directory required".into()));
+        if !self.commit_settings() {
             return;
         }
+        let save_dir = self.save_dir.clone();
         if self
             .commands
             .send(Command::Add {
@@ -176,6 +181,38 @@ impl DownloadUi {
         }
         self.url.clear();
         self.file_name.clear();
+    }
+
+    /// Persists the settings fields. Returns false when a field is invalid.
+    fn commit_settings(&mut self) -> bool {
+        let save_dir = self.save_dir.trim().to_string();
+        if save_dir.is_empty() {
+            self.model
+                .set_notice(Some("save directory required".into()));
+            return false;
+        }
+        let global_speed_limit_bps = match parse_speed_limit_kbps(&self.speed_limit) {
+            Ok(limit) => limit,
+            Err(err) => {
+                self.model.set_notice(Some(err));
+                return false;
+            }
+        };
+        let max_connections_per_server = match parse_max_connections(&self.max_connections) {
+            Ok(value) => value,
+            Err(err) => {
+                self.model.set_notice(Some(err));
+                return false;
+            }
+        };
+        self.save_dir = save_dir.clone();
+        self.send(Command::UpdateSettings(Settings {
+            save_dir,
+            global_speed_limit_bps,
+            max_connections_per_server,
+            autostart: self.autostart,
+        }));
+        true
     }
 
     fn send(&self, command: Command) {
@@ -222,12 +259,41 @@ impl eframe::App for DownloadUi {
                             .desired_width(520.0)
                             .hint_text("/path/to/downloads"),
                     );
-                    let commit_save = save.lost_focus()
-                        || (save.has_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-                    if commit_save {
-                        self.save_dir = self.save_dir.trim().to_string();
-                        self.send(Command::SetSaveDir(self.save_dir.clone()));
+                    if field_committed(&save, ui) {
+                        self.commit_settings();
+                    }
+                    ui.end_row();
+
+                    ui.label("Speed limit (KB/s)");
+                    let speed = ui.add(
+                        egui::TextEdit::singleline(&mut self.speed_limit)
+                            .desired_width(160.0)
+                            .hint_text("empty = unlimited"),
+                    );
+                    if field_committed(&speed, ui) {
+                        self.commit_settings();
+                    }
+                    ui.end_row();
+
+                    ui.label("Connections per server");
+                    let connections = ui.add(
+                        egui::TextEdit::singleline(&mut self.max_connections)
+                            .desired_width(80.0)
+                            .hint_text("1–16"),
+                    );
+                    if field_committed(&connections, ui) {
+                        self.commit_settings();
+                    }
+                    ui.end_row();
+
+                    ui.label("Start at login");
+                    let previous_autostart = self.autostart;
+                    if ui
+                        .checkbox(&mut self.autostart, "Open when I log in")
+                        .changed()
+                        && !self.commit_settings()
+                    {
+                        self.autostart = previous_autostart;
                     }
                     ui.end_row();
 
@@ -379,6 +445,54 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+fn field_committed(response: &egui::Response, ui: &egui::Ui) -> bool {
+    response.lost_focus()
+        || (response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+}
+
+/// Blank or `0` means unlimited. Other values are kibibytes per second, stored as bytes.
+pub fn parse_speed_limit_kbps(text: &str) -> Result<Option<u64>, String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    if !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("speed limit must be a whole number of KB/s".into());
+    }
+    let kbps: u64 = text
+        .parse()
+        .map_err(|_| "speed limit must be a whole number of KB/s".to_string())?;
+    if kbps == 0 {
+        return Ok(None);
+    }
+    kbps.checked_mul(1024)
+        .map(Some)
+        .ok_or_else(|| "speed limit is too large".into())
+}
+
+pub fn format_speed_limit_kbps(limit_bps: Option<u64>) -> String {
+    match limit_bps {
+        None | Some(0) => String::new(),
+        Some(bps) => (bps / 1024).to_string(),
+    }
+}
+
+pub fn parse_max_connections(text: &str) -> Result<u8, String> {
+    let text = text.trim();
+    let value: u16 = if text.is_empty() {
+        0
+    } else if text.bytes().all(|byte| byte.is_ascii_digit()) {
+        text.parse().unwrap_or(0)
+    } else {
+        0
+    };
+    if (1..=16).contains(&value) {
+        Ok(value as u8)
+    } else {
+        Err("connections per server must be from 1 to 16".into())
+    }
+}
+
 pub fn can_cancel(task: &DownloadTask) -> bool {
     if task.gid.is_none() {
         return matches!(task.status, TaskStatus::Queued | TaskStatus::Error);
@@ -470,7 +584,10 @@ fn native_options(title: &str, size: [f32; 2]) -> eframe::NativeOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{can_cancel, format_bytes, validate_task_input};
+    use super::{
+        can_cancel, format_bytes, format_speed_limit_kbps, parse_max_connections,
+        parse_speed_limit_kbps, validate_task_input,
+    };
     use download_core::task::{DownloadTask, NewTaskRequest, TaskStatus};
 
     fn task(status: TaskStatus, gid: Option<&str>) -> DownloadTask {
@@ -532,5 +649,25 @@ mod tests {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(512), "512 B");
         assert_eq!(format_bytes(1536), "1.5 KB");
+    }
+
+    #[test]
+    fn speed_limit_field_uses_kibibytes_and_blank_means_unlimited() {
+        assert_eq!(parse_speed_limit_kbps("").unwrap(), None);
+        assert_eq!(parse_speed_limit_kbps("  0 ").unwrap(), None);
+        assert_eq!(parse_speed_limit_kbps("1024").unwrap(), Some(1024 * 1024));
+        assert!(parse_speed_limit_kbps("1.5").is_err());
+        assert!(parse_speed_limit_kbps("-1").is_err());
+        assert_eq!(format_speed_limit_kbps(None), "");
+        assert_eq!(format_speed_limit_kbps(Some(2048)), "2");
+    }
+
+    #[test]
+    fn connections_must_be_from_1_to_16() {
+        assert_eq!(parse_max_connections("8").unwrap(), 8);
+        assert_eq!(parse_max_connections(" 16 ").unwrap(), 16);
+        assert!(parse_max_connections("0").is_err());
+        assert!(parse_max_connections("17").is_err());
+        assert!(parse_max_connections("").is_err());
     }
 }

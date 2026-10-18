@@ -71,3 +71,55 @@ pub fn register(exe: &Path) -> Result<(), String> {
     }
     Ok(())
 }
+
+#[cfg(any(windows, test))]
+pub const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+
+#[cfg(any(windows, test))]
+pub const RUN_VALUE_NAME: &str = "Download Tool";
+
+#[cfg(any(windows, test))]
+pub fn run_value(exe: &Path) -> String {
+    format!("\"{}\"", exe.display())
+}
+
+#[cfg(windows)]
+pub fn set_autostart(enabled: bool, exe: &Path) -> Result<(), String> {
+    if !enabled {
+        let output = Command::new("reg")
+            .args(["delete", RUN_KEY, "/v", RUN_VALUE_NAME, "/f"])
+            .output()
+            .map_err(|err| format!("reg delete: {err}"))?;
+        if output.status.success() || output.status.code() == Some(1) {
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "reg delete {RUN_KEY} failed ({}) {stderr}",
+            output.status
+        ));
+    }
+    let output = Command::new("reg")
+        .args([
+            "add",
+            RUN_KEY,
+            "/v",
+            RUN_VALUE_NAME,
+            "/t",
+            "REG_SZ",
+            "/d",
+            &run_value(exe),
+            "/f",
+        ])
+        .output()
+        .map_err(|err| format!("reg add: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!(
+            "reg add {RUN_KEY} failed ({}) {stderr}",
+            output.status
+        ))
+    }
+}
