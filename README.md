@@ -188,7 +188,7 @@ cargo run -p download-app -- 'dltool://add?url=http%3A%2F%2F127.0.0.1%2Ffile.bin
 ./scripts/package-macos.sh
 ```
 
-Produces `dist/macos/下载器.app` and `下载器.dmg`. Opening the `.app` is enough; dragging to Applications is optional. The DMG includes an Applications shortcut and `安装说明.txt`.
+Produces `dist/macos/Download Tool.app` and `download-tool.dmg`. Opening the `.app` is enough; dragging to Applications is optional. The DMG includes an Applications shortcut and `README.txt`.
 
 ### Windows
 
@@ -198,7 +198,7 @@ On a Windows machine (Rust + `aria2c.exe` on `PATH`):
 powershell -ExecutionPolicy Bypass -File scripts/package-windows-portable.ps1
 ```
 
-Produces `dist/windows/下载器/` and `下载器-portable.zip`. Unzip anywhere and double-click `下载器.exe` — no Setup.exe. Keep `aria2c.exe` and the CA bundle beside the exe. (Cargo still builds `download-tool.exe`; the packager renames it for distribution.)
+Produces `dist/windows/download-tool/` and `download-tool-portable.zip`. Unzip anywhere and double-click `download-tool.exe` — no Setup.exe. Keep `aria2c.exe` and the CA bundle beside the exe.
 
 ### Linux
 

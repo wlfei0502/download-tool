@@ -4,12 +4,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIST="${ROOT}/dist/macos"
-APP_NAME="下载器"
+APP_NAME="Download Tool"
 APP="${DIST}/${APP_NAME}.app"
 CONTENTS="${APP}/Contents"
 MACOS="${CONTENTS}/MacOS"
 BIN_NAME="download-tool"
-DMG="${DIST}/${APP_NAME}.dmg"
+DMG="${DIST}/download-tool.dmg"
 
 mkdir -p "${DIST}"
 rm -rf "${APP}" "${DMG}"
@@ -96,9 +96,9 @@ cat > "${CONTENTS}/Info.plist" <<'PLIST'
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>下载器</string>
+  <string>Download Tool</string>
   <key>CFBundleDisplayName</key>
-  <string>下载器</string>
+  <string>Download Tool</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -113,7 +113,7 @@ cat > "${CONTENTS}/Info.plist" <<'PLIST'
   <array>
     <dict>
       <key>CFBundleURLName</key>
-      <string>下载器</string>
+      <string>Download Tool</string>
       <key>CFBundleURLSchemes</key>
       <array>
         <string>dltool</string>
@@ -136,20 +136,20 @@ rm -rf "${STAGE}"
 mkdir -p "${STAGE}"
 cp -R "${APP}" "${STAGE}/"
 ln -s /Applications "${STAGE}/Applications"
-cat > "${STAGE}/安装说明.txt" <<EOF
-安装步骤：
-1. 将「${APP_NAME}」拖到旁边的「Applications」文件夹
-2. 打开「启动台」或「应用程序」，启动「${APP_NAME}」
-3. 若提示无法验证开发者：系统设置 → 隐私与安全性 → 仍要打开
+cat > "${STAGE}/README.txt" <<EOF
+Install:
+1. Drag "${APP_NAME}" onto the Applications folder
+2. Open it from Launchpad or Applications
+3. If macOS blocks an unidentified developer: System Settings → Privacy & Security → Open Anyway
 
-安装后，网站大文件下载可通过本机接口或 dltool:// 唤起下载器。
+After install, large-file downloads from the website can use the local API or dltool://.
 EOF
 
-# Staging already has: app + Applications symlink + 安装说明.txt
+# Staging already has: app + Applications symlink + README.txt
 rm -f "${DMG}"
 hdiutil create -volname "${APP_NAME}" -srcfolder "${STAGE}" -ov -format UDZO -imagekey zlib-level=9 "${DMG}" >/dev/null
 rm -rf "${STAGE}"
-rm -f "${DIST}/.${APP_NAME}-rw.dmg"
+rm -f "${DIST}/.Download-Tool-rw.dmg"
 
 LS="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 if [[ -x "${LS}" ]]; then
@@ -160,6 +160,6 @@ echo
 echo "App: ${APP}"
 echo "DMG: ${DMG}"
 echo
-echo "打开安装盘："
+echo "Open the disk image:"
 echo "  open \"${DMG}\""
-echo "把「${APP_NAME}」拖到「Applications」即可安装。"
+echo "Drag \"${APP_NAME}\" to Applications to install (optional)."
