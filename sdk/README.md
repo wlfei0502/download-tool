@@ -1,24 +1,10 @@
 # dltool-sdk
 
-Browser helper that sends small files through a normal download and large files to the desktop app.
+[![npm](https://img.shields.io/npm/v/dltool-sdk.svg)](https://www.npmjs.com/package/dltool-sdk)
 
-## Install / build
+Browser helper for [Download Tool](https://github.com/wlfei0502/download-tool): small files use a normal browser download; large files go to the desktop app on `127.0.0.1:29128` (or `dltool://` / an install page).
 
-```bash
-cd sdk
-npm install
-npm run build
-```
-
-Outputs:
-
-- `dist/index.js` / `dist/index.cjs` — for bundlers (`import` / `require`)
-- `dist/index.d.ts` — TypeScript types
-- `dist/dltool-sdk.iife.js` — for `<script>` / CDN
-
-### Other websites
-
-**npm**
+## Install
 
 ```bash
 npm install dltool-sdk
@@ -28,10 +14,11 @@ npm install dltool-sdk
 import { download } from "dltool-sdk";
 ```
 
-**Script tag**
+**Script / CDN** (globals: `DownloadToolSdk`, alias `DownloadTool`):
 
 ```html
 <script src="https://unpkg.com/dltool-sdk/dist/dltool-sdk.iife.js"></script>
+<!-- or https://cdn.jsdelivr.net/npm/dltool-sdk/dist/dltool-sdk.iife.js -->
 <script>
   DownloadToolSdk.download({
     downloadUrl: "https://cdn.example.com/file.zip",
@@ -42,26 +29,28 @@ import { download } from "dltool-sdk";
 </script>
 ```
 
+## Usage
+
 ```ts
 import { download } from "dltool-sdk";
 
-// Already know the download URL (no ticket API):
+// Direct URL (no ticket API):
 const result = await download({
   downloadUrl: "https://cdn.example.com/file.zip",
   fileName: "file.zip",
   size: 1234567890,
   config: {
     sizeThreshold: 104857600,
-    installUrl: "http://your-host/download-tool",
+    installUrl: "https://your-host/download-tool",
     localPort: 29128,
   },
 });
 
-// Or look up via fileId:
+// Or look up via fileId + website ticket API:
 await download({
   fileId: "f_01hxyz",
   size: 1234567890,
-  apiBase: "http://your-host",
+  apiBase: "https://your-host",
   config: { /* ... */ },
   onNeedInstall() {
     // Show the site's own install prompt.
@@ -70,6 +59,20 @@ await download({
 ```
 
 `DownloadTool.download` is the same function.
+
+## Build from source
+
+```bash
+cd sdk
+npm install
+npm run build
+```
+
+Outputs:
+
+- `dist/index.js` / `dist/index.cjs` — bundlers (`import` / `require`)
+- `dist/index.d.ts` — TypeScript types
+- `dist/dltool-sdk.iife.js` — `<script>` / CDN
 
 ## Order
 
@@ -89,4 +92,4 @@ await download({
 cd sdk && npm test
 ```
 
-Node 22.18 or newer runs the TypeScript tests directly. `fetch` and `window` are mocked.
+Requires Node **18+**. `fetch` and `window` are mocked.

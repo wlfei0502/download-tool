@@ -1,6 +1,6 @@
 # Download Tool
 
-Desktop downloader for large HTTP files. The app is Rust + egui, with aria2 doing the transfer. A website opens:
+Desktop downloader for large HTTP(S) files. The app is Rust + egui; aria2 does the transfer. Websites hand off big files via the **[dltool-sdk](https://www.npmjs.com/package/dltool-sdk)** package or the `dltool://` protocol:
 
 ```text
 dltool://add?url=<percent-encoded-http-url>&fileName=...&size=...
@@ -8,8 +8,7 @@ dltool://add?url=<percent-encoded-http-url>&fileName=...&size=...
 
 The inner download URL must be `http://` or `https://`. `fileName`, `size`, `referrer`, and `userAgent` are optional. A cold start parses those arguments and enqueues the download. If the app is already running, the new process forwards the same arguments and exits.
 
-The local API listens on **`127.0.0.1:29128`** only. JSON on that API and in the JS SDK is camelCase (`fileName`, `taskId`).
-
+The local API listens on **`127.0.0.1:29128`** only. JSON on that API and in the JS SDK is camelCase (`fileName`, `taskId`). Task history is stored in SQLite under the OS app-support directory (`tasks.db`).
 ## Build
 
 Rust edition 2021. From the repository root:
@@ -95,30 +94,57 @@ This `cargo run` plus protocol registration is the first smoke. Platform install
 
 ## SDK
 
-[`sdk/`](sdk/) is the browser helper. Small files download in the browser. Files at or above the threshold (default **104857600**, 100MB) probe the local app, then post a task or open `dltool://`.
+Published on npm as **[`dltool-sdk`](https://www.npmjs.com/package/dltool-sdk)** (npm blocks the word `download` in package names). Source is in [`sdk/`](sdk/).
+
+Small files download in the browser. Files at or above the threshold (default **104857600**, 100MB) probe the local app, then `POST /v1/tasks` or open `dltool://`. Full probe order and options: [sdk/README.md](sdk/README.md).
 
 ```bash
-cd sdk && npm test
+npm install dltool-sdk
 ```
 
-Node 22.18 or newer. Usage, field names, and the probe order are in [sdk/README.md](sdk/README.md).
-
 ```ts
-import { download } from "download-tool-sdk";
+import { download } from "dltool-sdk";
 
-const result = await download({
+// Direct URL (no ticket API):
+await download({
+  downloadUrl: "https://cdn.example.com/file.zip",
+  fileName: "file.zip",
+  size: 1234567890,
+  config: {
+    sizeThreshold: 104857600,
+    installUrl: "https://your-host/download-tool",
+    localPort: 29128,
+  },
+});
+
+// Or resolve via website ticket API:
+await download({
   fileId: "f_data",
   size: 1234567890,
   apiBase: "http://127.0.0.1:9090",
   config: {
-    sizeThreshold: 104857600,
     installUrl: "http://127.0.0.1:9090/download-tool",
     localPort: 29128,
-    protocol: "dltool",
   },
 });
 ```
 
+CDN / `<script>`:
+
+```html
+<script src="https://unpkg.com/dltool-sdk/dist/dltool-sdk.iife.js"></script>
+<script>
+  DownloadToolSdk.download({ /* same options */ });
+</script>
+```
+
+Local build / test:
+
+```bash
+cd sdk && npm install && npm run build && npm test
+```
+
+Node **18+**. Bundlers get ESM/CJS from `dist/`; the IIFE global is `DownloadToolSdk` (alias `DownloadTool`).
 ## Mock backend
 
 The mock implements the website ticket API on `http://127.0.0.1:9090` (file list, HMAC ticket, `Range` / `206`). No npm install.
