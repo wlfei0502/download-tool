@@ -1,9 +1,49 @@
-# download-tool SDK
+# dltool-sdk
 
 Browser helper that sends small files through a normal download and large files to the desktop app.
 
+## Install / build
+
+```bash
+cd sdk
+npm install
+npm run build
+```
+
+Outputs:
+
+- `dist/index.js` / `dist/index.cjs` — for bundlers (`import` / `require`)
+- `dist/index.d.ts` — TypeScript types
+- `dist/dltool-sdk.iife.js` — for `<script>` / CDN
+
+### Other websites
+
+**npm**
+
+```bash
+npm install dltool-sdk
+```
+
 ```ts
-import { download } from "download-tool-sdk";
+import { download } from "dltool-sdk";
+```
+
+**Script tag**
+
+```html
+<script src="https://unpkg.com/dltool-sdk/dist/dltool-sdk.iife.js"></script>
+<script>
+  DownloadToolSdk.download({
+    downloadUrl: "https://cdn.example.com/file.zip",
+    fileName: "file.zip",
+    size: 1234567890,
+    config: { installUrl: "https://your-host/download-tool" },
+  }).then(console.log);
+</script>
+```
+
+```ts
+import { download } from "dltool-sdk";
 
 // Already know the download URL (no ticket API):
 const result = await download({
