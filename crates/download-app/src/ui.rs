@@ -631,6 +631,10 @@ mod tests {
         );
         assert!(validate_task_input("http://example.com/a", "a.zip").is_ok());
         assert!(validate_task_input("HTTP://example.com/a", "a.zip").is_ok());
+        assert_eq!(
+            validate_task_input("http://user:pass@example.com/a", "a.zip").unwrap_err(),
+            "url must not include user info"
+        );
     }
 
     #[test]

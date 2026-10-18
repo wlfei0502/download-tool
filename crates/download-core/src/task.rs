@@ -38,18 +38,32 @@ pub struct DownloadTask {
     pub download_speed: u64,
 }
 
-/// Download URLs must use the `http://` scheme. Comparison is case-insensitive.
+/// Download URLs must use the `http://` scheme and must not carry userinfo
+/// (`user:password@host`). Scheme comparison is case-insensitive.
 pub fn require_http_url(url: &str) -> Result<(), String> {
     if url.is_empty() {
         return Err("url required".into());
     }
+    let prefix_len = "http://".len();
     let is_http = url
-        .get(.."http://".len())
+        .get(..prefix_len)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
     if !is_http {
         return Err("only http:// URLs are allowed".into());
     }
+    if authority_has_userinfo(&url[prefix_len..]) {
+        return Err("url must not include user info".into());
+    }
     Ok(())
+}
+
+/// `user:pass@host` before the path, query, or fragment.
+fn authority_has_userinfo(after_scheme: &str) -> bool {
+    let authority = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    authority.contains('@')
 }
 
 impl DownloadTask {

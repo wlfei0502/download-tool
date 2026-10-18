@@ -48,8 +48,8 @@ pub fn parse_dltool_url(input: &str) -> Result<NewTaskRequest, String> {
     let url = url.ok_or_else(|| "url required".to_string())?;
     require_http_url(&url)?;
     let file_name = match file_name {
-        Some(name) if safe_file_name(&name) => name,
-        _ => suggested_file_name(&url),
+        Some(name) => sanitize_file_name(&name, &url),
+        None => suggested_file_name(&url),
     };
 
     Ok(NewTaskRequest {
@@ -59,6 +59,15 @@ pub fn parse_dltool_url(input: &str) -> Result<NewTaskRequest, String> {
         referrer,
         user_agent,
     })
+}
+
+/// Keep `name` when it is a single path segment. Otherwise use the download URL's file name.
+pub fn sanitize_file_name(name: &str, url: &str) -> String {
+    if safe_file_name(name) {
+        name.to_string()
+    } else {
+        suggested_file_name(url)
+    }
 }
 
 /// Last path segment of an http URL, or `"download"` when that segment is not a file name.

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::manager::TaskManager;
+use crate::protocol::sanitize_file_name;
 use crate::settings::{clamp_connections, DEFAULT_MAX_CONNECTIONS_PER_SERVER};
 use crate::task::{require_http_url, DownloadTask, NewTaskRequest, TaskId, TaskStatus};
 use async_trait::async_trait;
@@ -85,8 +86,9 @@ impl<A: Aria2Api> DownloadEngine<A> {
     ///
     /// A previous attempt that never received a gid is started again. A task that
     /// already has a gid is left as-is.
-    pub async fn submit(&mut self, req: NewTaskRequest) -> Result<TaskId, String> {
+    pub async fn submit(&mut self, mut req: NewTaskRequest) -> Result<TaskId, String> {
         require_http_url(&req.url)?;
+        req.file_name = sanitize_file_name(&req.file_name, &req.url);
         let id = {
             let mut manager = self.manager.lock().await;
             manager.add(req)?
@@ -102,13 +104,14 @@ impl<A: Aria2Api> DownloadEngine<A> {
             return Ok(id);
         }
 
-        let (url, file_name) = {
+        let (url, stored_name) = {
             let manager = self.manager.lock().await;
             let task = manager
                 .get(&id)
                 .ok_or_else(|| "task not found".to_string())?;
             (task.url.clone(), task.file_name.clone())
         };
+        let file_name = sanitize_file_name(&stored_name, &url);
         match self
             .aria2
             .add_uri(
@@ -124,6 +127,7 @@ impl<A: Aria2Api> DownloadEngine<A> {
                 let task = manager
                     .get_mut(&id)
                     .ok_or_else(|| "task not found".to_string())?;
+                task.file_name = file_name;
                 task.gid = Some(gid);
                 task.status = TaskStatus::Active;
                 task.error = None;
@@ -206,12 +210,7 @@ impl<A: Aria2Api> DownloadEngine<A> {
         };
         self.aria2.remove(&gid).await?;
         let mut manager = self.manager.lock().await;
-        let task = manager
-            .get_mut(id)
-            .ok_or_else(|| "task not found".to_string())?;
-        task.status = TaskStatus::Error;
-        task.error = Some("cancelled".to_string());
-        task.download_speed = 0;
+        manager.remove(id)?;
         Ok(())
     }
 

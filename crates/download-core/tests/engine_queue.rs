@@ -472,10 +472,7 @@ async fn pause_resume_and_cancel_call_aria2() {
     assert_eq!(task(&engine, &id).await.status, TaskStatus::Active);
 
     engine.cancel_task(&id).await.expect("cancel");
-    let task = task(&engine, &id).await;
-    assert_eq!(task.status, TaskStatus::Error);
-    assert_eq!(task.error.as_deref(), Some("cancelled"));
-    assert_eq!(task.download_speed, 0);
+    assert!(engine.manager().await.list().is_empty());
 
     assert_eq!(
         aria.calls(),
@@ -497,6 +494,43 @@ async fn pause_resume_and_cancel_call_aria2() {
             },
         ]
     );
+}
+
+#[tokio::test]
+async fn cancel_with_gid_removes_task_and_allows_same_url() {
+    let aria = FakeAria2::default();
+    let mut engine = DownloadEngine::new(aria.clone(), "/downloads");
+    let req = request("http://example.com/a.zip", "a.zip");
+    let id = engine.submit(req.clone()).await.expect("submit");
+
+    engine.cancel_task(&id).await.expect("cancel");
+    assert!(engine.manager().await.get(&id).is_none());
+    assert!(engine.manager().await.find_by_url(&req.url).is_none());
+    assert!(aria
+        .calls()
+        .iter()
+        .any(|call| matches!(call, Call::Remove { gid } if gid == "gid-1")));
+
+    let again = engine.submit(req).await.expect("readd");
+    assert_ne!(again, id);
+    assert_eq!(task(&engine, &again).await.status, TaskStatus::Active);
+    assert_eq!(task(&engine, &again).await.gid.as_deref(), Some("gid-2"));
+}
+
+#[tokio::test]
+async fn submit_replaces_an_unsafe_file_name_before_aria2() {
+    let aria = FakeAria2::default();
+    let mut engine = DownloadEngine::new(aria.clone(), "/downloads");
+    let id = engine
+        .submit(request("http://example.com/d/t", "../secret"))
+        .await
+        .expect("submit");
+
+    assert_eq!(task(&engine, &id).await.file_name, "t");
+    assert!(aria
+        .calls()
+        .iter()
+        .any(|call| matches!(call, Call::AddUri { out, .. } if out == "t")));
 }
 
 #[tokio::test]

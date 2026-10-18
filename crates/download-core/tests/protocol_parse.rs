@@ -59,6 +59,14 @@ fn decodes_a_file_name_taken_from_the_download_path() {
 }
 
 #[test]
+fn rejects_download_urls_with_userinfo() {
+    let err =
+        parse_dltool_url("dltool://add?url=http%3A%2F%2Fuser%3Apass%40host%2Fd%2Ft&fileName=a.zip")
+            .unwrap_err();
+    assert!(err.contains("user info"), "{err}");
+}
+
+#[test]
 fn replaces_an_unsafe_file_name() {
     let req = parse_dltool_url("dltool://add?url=http%3A%2F%2Fhost%2Fd%2Ft&fileName=..%2Fsecret")
         .unwrap();
