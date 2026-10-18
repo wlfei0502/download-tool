@@ -28,9 +28,10 @@ const result = await download({
 1. `POST {apiBase}/api/download-ticket` with `{ fileId }`. The ticket's `downloadUrl` stays `http://` and is passed through unchanged.
 2. If `size < sizeThreshold` (default **104857600**), click an `<a download>` for that URL and return `{ mode: "browser" }`.
 3. Otherwise `GET http://127.0.0.1:{localPort}/health` with a **400ms** timeout. The default port is **29128**.
-4. Health OK: `POST /v1/tasks` with camelCase `{ url, fileName, size, referrer, userAgent }` and return `{ mode: "local", taskId }`.
-5. Connection error or a non-OK health status: set `window.location.href` to `{protocol}://add?url=...&fileName=...&size=...` (default scheme `dltool`) and return `{ mode: "protocol" }`.
-6. Health timeout: call `onNeedInstall` when it was provided. If it was omitted and `installUrl` is set, open that URL. Return `{ mode: "install" }`.
+4. Health ready (`ok: true` and `aria2` is not `false`): `POST /v1/tasks` with camelCase `{ url, fileName, size, referrer, userAgent }` and return `{ mode: "local", taskId }`.
+5. Connection error, or a health body that is not ready: set `window.location.href` to `{protocol}://add?url=...&fileName=...&size=...` (default scheme `dltool`), then poll `/health` for about **2s**.
+6. If that poll sees the app, return `{ mode: "protocol" }`. If the app is still unreachable, call `onNeedInstall` when it was provided. If it was omitted and `installUrl` is set, open that URL. Return `{ mode: "install" }`.
+7. A first-probe timeout uses that same install path and does not open the protocol URL.
 
 `referrer` comes from `document.referrer` (or the page URL). `userAgent` comes from `navigator.userAgent`. Empty values are left off the task body and the protocol URL.
 

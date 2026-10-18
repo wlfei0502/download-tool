@@ -4,14 +4,27 @@ use download_core::manager::TaskManager;
 use download_local_api::{app, AppState, DEFAULT_PORT};
 use http_body_util::BodyExt;
 use serde_json::{json, Value};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tower::ServiceExt;
 
 fn state() -> AppState {
+    state_with_aria2(true)
+}
+
+fn state_with_aria2(ready: bool) -> AppState {
     AppState {
         tasks: Arc::new(Mutex::new(TaskManager::new())),
+        aria2_ready: Arc::new(AtomicBool::new(ready)),
     }
+}
+
+fn header<'a>(res: &'a axum::response::Response, name: &str) -> &'a str {
+    res.headers()
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
 }
 
 async fn json_body(res: axum::response::Response) -> Value {
@@ -39,7 +52,83 @@ async fn health_ok() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(
         json_body(res).await,
-        json!({"ok": true, "version": "0.1.0"})
+        json!({"ok": true, "aria2": true, "version": "0.1.0"})
+    );
+}
+
+#[tokio::test]
+async fn health_is_unavailable_when_aria2_is_not_ready() {
+    let app = app(state_with_aria2(false));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .header("origin", "http://site.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        header(&res, "access-control-allow-origin"),
+        "http://site.example"
+    );
+    assert_eq!(header(&res, "access-control-allow-private-network"), "true");
+    assert_eq!(
+        json_body(res).await,
+        json!({"ok": false, "aria2": false, "version": "0.1.0"})
+    );
+}
+
+#[tokio::test]
+async fn cors_preflight_allows_page_origin_and_private_network() {
+    let app = app(state());
+    for uri in ["/health", "/v1/tasks"] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri(uri)
+                    .header("origin", "http://site.example")
+                    .header("access-control-request-method", "POST")
+                    .header("access-control-request-private-network", "true")
+                    .header("access-control-request-headers", "content-type")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NO_CONTENT, "{uri}");
+        assert_eq!(
+            header(&res, "access-control-allow-origin"),
+            "http://site.example"
+        );
+        assert_eq!(header(&res, "access-control-allow-private-network"), "true");
+        assert!(
+            header(&res, "access-control-allow-methods").contains("POST"),
+            "{uri}"
+        );
+        assert!(
+            header(&res, "access-control-allow-headers").contains("content-type"),
+            "{uri}"
+        );
+    }
+
+    let open = app
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(header(&open, "access-control-allow-origin"), "*");
+    assert_eq!(
+        header(&open, "access-control-allow-private-network"),
+        "true"
     );
 }
 
@@ -230,6 +319,88 @@ async fn post_task_rejects_non_http_urls() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn post_task_rejects_url_userinfo() {
+    let app = app(state());
+    for url in [
+        "http://user:secret@example.com/d/x",
+        "HTTP://user@example.com/d/x",
+    ] {
+        let body = json!({
+            "url": url,
+            "fileName": "x.bin"
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_body(res).await["error"],
+            "url must not include user info"
+        );
+    }
+
+    let listed = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/tasks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(json_body(listed).await.as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn post_task_sanitizes_unsafe_file_names() {
+    let app = app(state());
+    let body = json!({
+        "url": "http://example.com/d/report.bin",
+        "fileName": "../../secret"
+    });
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/tasks")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let listed = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/tasks")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let tasks = json_body(listed).await;
+    let task = tasks
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| task["url"] == "http://example.com/d/report.bin")
+        .expect("created task");
+    assert_eq!(task["fileName"], "report.bin");
 }
 
 #[tokio::test]

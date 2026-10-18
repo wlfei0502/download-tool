@@ -47,8 +47,12 @@ Startup registers `dltool://` (best effort; a failure is printed and the app sti
 
 ```http
 GET /health
-{"ok":true,"version":"0.1.0"}
+{"ok":true,"aria2":true,"version":"0.1.0"}
+```
 
+`/health` is **503** with `"ok": false` and `"aria2": false` when aria2 is not ready. The SDK does not treat that as a local handoff. Responses include CORS and `Access-Control-Allow-Private-Network` so a page on another origin can probe the loopback API.
+
+```http
 POST /v1/tasks
 Content-Type: application/json
 

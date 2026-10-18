@@ -226,12 +226,12 @@ SDK order, for the checklist below:
 
 1. `POST {apiBase}/api/download-ticket` with `{ fileId }`. Keep `downloadUrl` as the `http://` value from the ticket.
 2. If `size < sizeThreshold`, the browser downloads that URL.
-3. Otherwise `GET http://127.0.0.1:29128/health` (400ms).
-4. Health OK: `POST /v1/tasks` with camelCase `{ url, fileName, size, referrer, userAgent }`.
-5. Connection refused or a non-OK health status: `dltool://add?url=...&fileName=...&size=...`.
-6. Health timeout: `onNeedInstall`, or open `installUrl`.
+3. Otherwise `GET http://127.0.0.1:29128/health` (400ms). Ready means HTTP success, `ok: true`, and `aria2` is not `false`.
+4. Health ready: `POST /v1/tasks` with camelCase `{ url, fileName, size, referrer, userAgent }`.
+5. Connection refused, or health that is not ready: `dltool://add?url=...&fileName=...&size=...`, then poll `/health` for about 2s.
+6. If the app answers that poll, the handoff stays on the protocol. If it is still unreachable, `onNeedInstall` or `installUrl`. A first-probe timeout uses that install path directly.
 
-The local API binds `127.0.0.1` only. A browser on another origin needs CORS on that API before `fetch` can read `/health`. The mock allows the request origin on its own routes (and `*` when there is no `Origin`).
+The local API binds `127.0.0.1` only. `GET`/`POST`/`OPTIONS` on `/health`, `/v1/tasks`, and `/v1/invoke` echo the request `Origin` (or `*` when there is none) and send `Access-Control-Allow-Private-Network: true`. The mock allows the request origin on its own routes (and `*` when there is no `Origin`).
 
 ## Manual integration checklist
 

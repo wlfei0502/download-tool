@@ -7,8 +7,11 @@ export const DEFAULT_LOCAL_PORT = 29128;
 export const DEFAULT_PROTOCOL = "dltool";
 
 const HEALTH_TIMEOUT_MS = 400;
+/** How long to wait for the app after `dltool://` before showing install. */
+const PROTOCOL_SETTLE_MS = 2000;
+const PROTOCOL_POLL_GAP_MS = 200;
 
-type Probe = "ok" | "down" | "timeout";
+type Probe = "ok" | "down" | "unready" | "timeout";
 
 type LocalTask = {
   url: string;
@@ -40,9 +43,11 @@ type BrowserWindow = {
  * Hand a file to the browser, the local download app, or the install guide.
  *
  * Small files (`size < sizeThreshold`) download in the browser. Larger files
- * probe `http://127.0.0.1:{port}/health`. A healthy app receives `POST /v1/tasks`.
- * A refused connection opens `{protocol}://add?...`. A health timeout calls
- * `onNeedInstall` or opens `installUrl`.
+ * probe `http://127.0.0.1:{port}/health`. A ready app (`ok` and aria2 not false)
+ * receives `POST /v1/tasks`. A refused connection or a not-ready health body
+ * opens `{protocol}://add?...` and polls `/health` briefly. If the app is still
+ * unreachable, or the first probe times out, this calls `onNeedInstall` or
+ * opens `installUrl`.
  */
 export async function download(options: DownloadOptions): Promise<DownloadResult> {
   const threshold = options.config?.sizeThreshold ?? DEFAULT_SIZE_THRESHOLD;
@@ -62,16 +67,24 @@ export async function download(options: DownloadOptions): Promise<DownloadResult
   }
 
   if (probe === "timeout") {
-    options.onNeedInstall?.();
-    const installUrl = options.config?.installUrl;
-    if (!options.onNeedInstall && installUrl) {
-      navigate(installUrl);
-    }
-    return { mode: "install" };
+    return installResult(options);
   }
 
   navigate(buildProtocolUrl(protocol, toLocalTask(ticket)));
+  const settled = await settleAfterProtocol(port);
+  if (settled === "down") {
+    return installResult(options);
+  }
   return { mode: "protocol" };
+}
+
+function installResult(options: DownloadOptions): DownloadResult {
+  options.onNeedInstall?.();
+  const installUrl = options.config?.installUrl;
+  if (!options.onNeedInstall && installUrl) {
+    navigate(installUrl);
+  }
+  return { mode: "install" };
 }
 
 export const DownloadTool = { download };
@@ -92,6 +105,9 @@ function parseTicket(value: unknown, fallbackSize: number): DownloadTicket {
   }
   if (!body.downloadUrl.toLowerCase().startsWith("http://")) {
     throw new Error("download ticket URL must use http://");
+  }
+  if (httpUrlHasUserInfo(body.downloadUrl)) {
+    throw new Error("download ticket URL must not include user info");
   }
   if (typeof body.fileName !== "string" || body.fileName.length === 0) {
     throw new Error("download ticket missing fileName");
@@ -130,13 +146,47 @@ async function probeHealth(port: number): Promise<Probe> {
       cache: "no-store",
       credentials: "omit",
     });
-    return response.ok ? "ok" : "down";
+    if (!response.ok) return "unready";
+    const body = await response.json().catch(() => null);
+    return healthReady(body) ? "ok" : "unready";
   } catch (error) {
     if (controller.signal.aborted || isAbortError(error)) return "timeout";
     return "down";
   } finally {
     clearTimeout(timer);
   }
+}
+
+function healthReady(body: unknown): boolean {
+  if (!body || typeof body !== "object") return false;
+  const record = body as { ok?: unknown; aria2?: unknown };
+  return record.ok === true && record.aria2 !== false;
+}
+
+function httpUrlHasUserInfo(value: string): boolean {
+  const match = /^http:\/\//i.exec(value);
+  if (!match) return false;
+  const authority = value.slice(match[0].length).split(/[/?#]/, 1)[0] ?? "";
+  return authority.includes("@");
+}
+
+async function settleAfterProtocol(port: number): Promise<"ok" | "unready" | "down"> {
+  const deadline = Date.now() + PROTOCOL_SETTLE_MS;
+  while (true) {
+    const probe = await probeHealth(port);
+    if (probe === "ok") return "ok";
+    if (probe === "unready") return "unready";
+    if (Date.now() >= deadline) return "down";
+    const pause = Math.min(PROTOCOL_POLL_GAP_MS, Math.max(0, deadline - Date.now()));
+    if (pause === 0) return "down";
+    await delay(pause);
+  }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
 
 async function createLocalTask(port: number, task: LocalTask): Promise<string> {

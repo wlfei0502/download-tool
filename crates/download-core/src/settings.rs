@@ -98,6 +98,23 @@ impl Settings {
     }
 }
 
+/// OS downloads directory from `directories::UserDirs`, then `$HOME/Downloads`
+/// when that folder exists, then the current directory.
+pub fn default_save_dir() -> PathBuf {
+    if let Some(downloads) =
+        directories::UserDirs::new().and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
+    {
+        return downloads;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let downloads = PathBuf::from(home).join("Downloads");
+        if downloads.is_dir() {
+            return downloads;
+        }
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
 pub fn clamp_connections(value: u8) -> u8 {
     if value == 0 {
         1

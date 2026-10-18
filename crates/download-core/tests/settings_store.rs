@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use download_core::settings::Settings;
+use download_core::settings::{default_save_dir, Settings};
 
 #[test]
 fn save_and_load_roundtrip_in_temp_dir() {
@@ -36,6 +36,18 @@ fn file_path_is_download_tool_settings_json_under_the_config_dir() {
         user.ends_with(Path::new("download-tool").join("settings.json")),
         "{user:?}"
     );
+}
+
+#[test]
+fn default_save_dir_prefers_the_os_download_directory() {
+    let resolved = default_save_dir();
+    if let Some(downloads) =
+        directories::UserDirs::new().and_then(|dirs| dirs.download_dir().map(Path::to_path_buf))
+    {
+        assert_eq!(resolved, downloads);
+        return;
+    }
+    assert_eq!(resolved, std::env::current_dir().expect("cwd"));
 }
 
 #[test]

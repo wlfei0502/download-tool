@@ -70,7 +70,17 @@ function installFetch(
 }
 
 function installBrowser() {
-  const location = { href: PAGE };
+  const hrefs: string[] = [];
+  let current = PAGE;
+  const location = {
+    get href() {
+      return current;
+    },
+    set href(value: string) {
+      current = value;
+      hrefs.push(value);
+    },
+  };
   const clicks: AnchorClick[] = [];
   const document = {
     referrer: REFERRER,
@@ -101,7 +111,7 @@ function installBrowser() {
     writable: true,
     value: { userAgent: USER_AGENT },
   });
-  return { location, clicks };
+  return { location, clicks, hrefs };
 }
 
 afterEach(() => {
@@ -232,27 +242,31 @@ describe("download", () => {
     assert.equal(calls[1]?.url, "http://127.0.0.1:39200/health");
   });
 
-  it("invokes the dltool protocol when health is unreachable", async () => {
+  it("returns install when the protocol launch leaves health down", async () => {
     const calls = installFetch(async (url) => {
       if (url.endsWith("/api/download-ticket")) return jsonResponse(ticketBody(200_000_000));
       if (url.endsWith("/health")) throw new TypeError("Failed to fetch");
       throw new Error(`unexpected ${url}`);
     });
-    const { location } = installBrowser();
+    const { hrefs } = installBrowser();
     let installCalls = 0;
+    const started = Date.now();
 
     const result = await download({
       fileId: FILE_ID,
       size: 200_000_000,
       apiBase: API_BASE,
+      config: { installUrl: "http://site.example/install" },
       onNeedInstall() {
         installCalls += 1;
       },
     });
 
-    assert.deepEqual(result, { mode: "protocol" });
-    assert.equal(installCalls, 0);
-    const opened = new URL(location.href);
+    const elapsed = Date.now() - started;
+    assert.deepEqual(result, { mode: "install" });
+    assert.equal(installCalls, 1);
+    assert.equal(hrefs.length, 1);
+    const opened = new URL(hrefs[0] ?? "");
     assert.equal(opened.protocol, "dltool:");
     assert.equal(opened.hostname, "add");
     assert.equal(opened.searchParams.get("url"), DOWNLOAD_URL);
@@ -264,24 +278,61 @@ describe("download", () => {
       calls.some((call) => call.url.endsWith("/v1/tasks")),
       false,
     );
+    assert.ok(elapsed >= 1500, `expected a brief health poll, took ${elapsed}ms`);
+    assert.ok(elapsed < 5000, `protocol settle was too slow: ${elapsed}ms`);
   });
 
-  it("uses a configured protocol scheme", async () => {
+  it("opens installUrl when the app stays down and no callback is set", async () => {
     installFetch(async (url) => {
       if (url.endsWith("/api/download-ticket")) return jsonResponse(ticketBody(200_000_000));
-      throw new TypeError("Failed to fetch");
+      if (url.endsWith("/health")) throw new TypeError("Failed to fetch");
+      throw new Error(`unexpected ${url}`);
+    });
+    const { hrefs, location } = installBrowser();
+
+    const result = await download({
+      fileId: FILE_ID,
+      size: 200_000_000,
+      apiBase: API_BASE,
+      config: { installUrl: "http://site.example/get-the-app" },
+    });
+
+    assert.deepEqual(result, { mode: "install" });
+    assert.equal(new URL(hrefs[0] ?? "").protocol, "dltool:");
+    assert.equal(location.href, "http://site.example/get-the-app");
+  });
+
+  it("keeps protocol mode when health comes up after the scheme open", async () => {
+    let healthAttempts = 0;
+    const calls = installFetch(async (url) => {
+      if (url.endsWith("/api/download-ticket")) return jsonResponse(ticketBody(200_000_000));
+      if (url.endsWith("/health")) {
+        healthAttempts += 1;
+        if (healthAttempts === 1) throw new TypeError("Failed to fetch");
+        return jsonResponse({ ok: true, aria2: true });
+      }
+      throw new Error(`unexpected ${url}`);
     });
     const { location } = installBrowser();
+    let installCalls = 0;
 
     const result = await download({
       fileId: FILE_ID,
       size: 200_000_000,
       apiBase: API_BASE,
       config: { protocol: "customdl" },
+      onNeedInstall() {
+        installCalls += 1;
+      },
     });
 
     assert.deepEqual(result, { mode: "protocol" });
+    assert.equal(installCalls, 0);
     assert.equal(new URL(location.href).protocol, "customdl:");
+    assert.equal(
+      calls.some((call) => call.url.endsWith("/v1/tasks")),
+      false,
+    );
   });
 
   it("opens the protocol when health responds with an error status", async () => {
@@ -367,6 +418,28 @@ describe("download", () => {
     assert.equal(location.href, "http://site.example/get-the-app");
   });
 
+  it("does not hand off locally when aria2 is reported down", async () => {
+    const calls = installFetch(async (url) => {
+      if (url.endsWith("/api/download-ticket")) return jsonResponse(ticketBody(200_000_000));
+      if (url.endsWith("/health")) return jsonResponse({ ok: true, aria2: false });
+      throw new Error(`unexpected ${url}`);
+    });
+    const { location } = installBrowser();
+
+    const result = await download({
+      fileId: FILE_ID,
+      size: 200_000_000,
+      apiBase: API_BASE,
+    });
+
+    assert.deepEqual(result, { mode: "protocol" });
+    assert.equal(new URL(location.href).protocol, "dltool:");
+    assert.equal(
+      calls.some((call) => call.url.endsWith("/v1/tasks")),
+      false,
+    );
+  });
+
   it("rejects a ticket whose download URL is not http", async () => {
     installFetch(async () =>
       jsonResponse({
@@ -379,6 +452,21 @@ describe("download", () => {
     await assert.rejects(
       download({ fileId: FILE_ID, size: 1024, apiBase: API_BASE }),
       /http:\/\//,
+    );
+  });
+
+  it("rejects a ticket whose download URL contains user info", async () => {
+    installFetch(async () =>
+      jsonResponse({
+        ...ticketBody(1024),
+        downloadUrl: "http://user:secret@127.0.0.1:9090/d/token",
+      }),
+    );
+    installBrowser();
+
+    await assert.rejects(
+      download({ fileId: FILE_ID, size: 1024, apiBase: API_BASE }),
+      /user info/,
     );
   });
 

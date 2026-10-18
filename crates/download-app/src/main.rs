@@ -5,6 +5,7 @@ mod ui;
 
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,9 +17,9 @@ use download_core::aria2::process::Aria2Process;
 use download_core::aria2::rpc::Aria2Client;
 use download_core::engine::DownloadEngine;
 use download_core::manager::TaskManager;
-use download_core::settings::Settings;
-use download_core::task::{NewTaskRequest, TaskId, TaskStatus};
-use download_local_api::{app, AppState, DEFAULT_PORT};
+use download_core::settings::{default_save_dir, Settings};
+use download_core::task::{DownloadTask, NewTaskRequest, TaskId, TaskStatus};
+use download_local_api::{preflight, routes, with_cors, AppState, DEFAULT_PORT};
 use single_instance::Activation;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, Mutex};
@@ -99,7 +100,8 @@ async fn prepare(activation: Activation) -> Result<DownloadUi, String> {
     let listener = bind_api().await?;
     eprintln!("listening on http://127.0.0.1:{DEFAULT_PORT}");
 
-    let router = api_router(Arc::clone(&tasks), activation.clone());
+    let aria2_ready = Arc::new(AtomicBool::new(engine.is_some()));
+    let router = api_router(Arc::clone(&tasks), aria2_ready, activation.clone());
     let server = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, router).await {
             eprintln!("local API stopped: {err}");
@@ -135,11 +137,17 @@ async fn prepare(activation: Activation) -> Result<DownloadUi, String> {
     ))
 }
 
-fn api_router(tasks: Arc<Mutex<TaskManager>>, activation: Activation) -> Router {
-    app(AppState { tasks }).merge(
-        Router::new()
-            .route("/v1/invoke", post(invoke))
-            .with_state(activation),
+fn api_router(
+    tasks: Arc<Mutex<TaskManager>>,
+    aria2_ready: Arc<AtomicBool>,
+    activation: Activation,
+) -> Router {
+    with_cors(
+        routes(AppState { tasks, aria2_ready }).merge(
+            Router::new()
+                .route("/v1/invoke", post(invoke).options(preflight))
+                .with_state(activation),
+        ),
     )
 }
 
@@ -353,16 +361,6 @@ fn with_default_save_dir(mut settings: Settings) -> Settings {
 fn sync_autostart(enabled: bool) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|err| format!("current executable: {err}"))?;
     platform::set_autostart(enabled, &exe)
-}
-
-fn default_save_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME") {
-        let downloads = PathBuf::from(home).join("Downloads");
-        if downloads.is_dir() {
-            return downloads;
-        }
-    }
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 async fn run_engine(
@@ -611,6 +609,11 @@ async fn enqueue_requests(
     }
 }
 
+/// Queued work, and failed adds that never received a gid, can still be started.
+fn is_waiting_to_start(task: &DownloadTask) -> bool {
+    task.gid.is_none() && matches!(task.status, TaskStatus::Queued | TaskStatus::Error)
+}
+
 async fn start_queued(
     engine: &mut DownloadEngine<Aria2Client>,
     save_dir: &str,
@@ -621,7 +624,7 @@ async fn start_queued(
         manager
             .list()
             .into_iter()
-            .filter(|task| task.status == TaskStatus::Queued && task.gid.is_none())
+            .filter(is_waiting_to_start)
             .map(|task| NewTaskRequest {
                 url: task.url,
                 file_name: task.file_name,
@@ -661,13 +664,15 @@ mod tests {
     use axum::Router;
     use download_core::aria2::rpc::Aria2Client;
 
+    use std::sync::atomic::AtomicBool;
+
     use super::{
         api_listen_addr, api_router, apply_settings, bind_api, control, enqueue_requests,
-        pause_all, retry_until_rpc_ready, Control, StoredSettings,
+        is_waiting_to_start, pause_all, retry_until_rpc_ready, Control, StoredSettings,
     };
     use crate::single_instance::Activation;
     use download_core::manager::TaskManager;
-    use download_core::task::{NewTaskRequest, TaskStatus};
+    use download_core::task::{DownloadTask, NewTaskRequest, TaskStatus};
     use download_local_api::DEFAULT_PORT;
     use tokio::sync::Mutex;
 
@@ -683,7 +688,11 @@ mod tests {
     #[tokio::test]
     async fn invoke_asks_the_existing_window_to_show() {
         let activation = Activation::new();
-        let router = api_router(Arc::new(Mutex::new(TaskManager::new())), activation.clone());
+        let router = api_router(
+            Arc::new(Mutex::new(TaskManager::new())),
+            Arc::new(AtomicBool::new(true)),
+            activation.clone(),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("invoke listener");
@@ -720,6 +729,88 @@ mod tests {
         assert!(response.contains("\"ok\":true"), "{response}");
         assert!(activation.take_show());
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn invoke_preflight_allows_the_page_origin_and_private_network() {
+        let router = api_router(
+            Arc::new(Mutex::new(TaskManager::new())),
+            Arc::new(AtomicBool::new(false)),
+            Activation::new(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("preflight listener");
+        let addr = listener.local_addr().expect("preflight addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("preflight server");
+        });
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let response = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut client = std::net::TcpStream::connect(addr).expect("connect preflight");
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            client
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("write timeout");
+            client
+                .write_all(
+                    b"OPTIONS /v1/invoke HTTP/1.1\r\n\
+                      Host: 127.0.0.1\r\n\
+                      Origin: http://site.example\r\n\
+                      Access-Control-Request-Method: POST\r\n\
+                      Access-Control-Request-Private-Network: true\r\n\
+                      Connection: close\r\n\
+                      \r\n",
+                )
+                .expect("write preflight");
+            let mut response = String::new();
+            client
+                .read_to_string(&mut response)
+                .expect("read preflight");
+            response
+        })
+        .await
+        .expect("preflight client");
+        assert!(response.contains("204"), "{response}");
+        let lowered = response.to_ascii_lowercase();
+        assert!(
+            lowered.contains("access-control-allow-origin: http://site.example"),
+            "{response}"
+        );
+        assert!(
+            lowered.contains("access-control-allow-private-network: true"),
+            "{response}"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn error_without_gid_is_started_again() {
+        let mut queued = DownloadTask::from_request(request("http://example.com/q", "q.bin"));
+        queued.status = TaskStatus::Queued;
+        assert!(is_waiting_to_start(&queued));
+
+        let mut failed = DownloadTask::from_request(request("http://example.com/e", "e.bin"));
+        failed.status = TaskStatus::Error;
+        assert!(is_waiting_to_start(&failed));
+
+        failed.gid = Some("gid-1".into());
+        assert!(!is_waiting_to_start(&failed));
+
+        let mut active = DownloadTask::from_request(request("http://example.com/a", "a.bin"));
+        active.status = TaskStatus::Active;
+        assert!(!is_waiting_to_start(&active));
     }
 
     #[tokio::test]
