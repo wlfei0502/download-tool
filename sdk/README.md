@@ -31,19 +31,52 @@ import { download } from "dltool-sdk";
 
 ## Usage
 
+`onNeedInstall` works for **both** direct URL and ticket/`fileId` flows. It runs when the file is at or above `sizeThreshold` and the desktop app is still unreachable (after `dltool://` or a first-probe timeout). Small files never call it — they stay in the browser.
+
 ```ts
 import { download } from "dltool-sdk";
 
-// Direct URL (no ticket API):
+function offerOsInstaller() {
+  // Host these files yourself (names match scripts/package-*.sh|.ps1 outputs).
+  const INSTALLERS = {
+    mac: "https://your-cdn.example/releases/download-tool.dmg",
+    win: "https://your-cdn.example/releases/download-tool-portable.zip",
+    linux: "https://your-cdn.example/releases/download-tool-linux.tar.gz", // optional; not shipped yet
+  };
+
+  const ua = navigator.userAgent;
+  const platform = navigator.platform || "";
+  let url = INSTALLERS.linux;
+  if (/Mac|iPhone|iPad|iPod/i.test(ua) || /Mac/i.test(platform)) {
+    url = INSTALLERS.mac;
+  } else if (/Win/i.test(ua) || /Win/i.test(platform)) {
+    url = INSTALLERS.win;
+  }
+
+  // Prefer a temporary <a> so this tab is not navigated away.
+  // (window.location.href = url would replace the current page.)
+  const a = document.createElement("a");
+  a.href = url;
+  a.rel = "noopener";
+  a.download = ""; // hint; ignored cross-origin, but still starts a download for many CDNs
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  // Or open a dedicated install page without leaving this page:
+  // window.open("https://your-host/download-tool", "_blank", "noopener");
+}
+
+// Direct URL (no ticket API) — same onNeedInstall:
 const result = await download({
   downloadUrl: "https://cdn.example.com/file.zip",
   fileName: "file.zip",
   size: 1234567890,
   config: {
     sizeThreshold: 104857600,
-    installUrl: "https://your-host/download-tool",
     localPort: 29128,
   },
+  onNeedInstall: offerOsInstaller,
 });
 
 // Or look up via fileId + website ticket API:
@@ -51,14 +84,21 @@ await download({
   fileId: "f_01hxyz",
   size: 1234567890,
   apiBase: "https://your-host",
-  config: { /* ... */ },
-  onNeedInstall() {
-    // Show the site's own install prompt.
-  },
+  onNeedInstall: offerOsInstaller,
 });
 ```
 
 `DownloadTool.download` is the same function.
+
+When `onNeedInstall` is set, the SDK **does not** open `installUrl` — your callback owns the UX. Omit the callback and set `config.installUrl` if you prefer a single install page with links for every OS (see [examples/install-page](../examples/install-page/index.html)).
+
+**Note:** the SDK’s own fallback (`installUrl` / protocol handoff) uses `window.location.href`, which **does** leave the current page. Use `onNeedInstall` when you want to keep the site open.
+
+| OS | Typical package | Notes |
+|----|-----------------|--------|
+| macOS | `download-tool.dmg` | Open → run **Download Tool.app** |
+| Windows | `download-tool-portable.zip` | Unzip → run `download-tool.exe` (keep `aria2c.exe` + CA beside it) |
+| Linux | (not packaged yet) | Point at your own tarball/AppImage when you ship one |
 
 ## Build from source
 
