@@ -1,14 +1,15 @@
 # Build a portable Windows folder + zip. No installer.
 # Run on Windows (PowerShell), with Rust and aria2c available.
-# Output: dist/windows/download-tool/  and  dist/windows/download-tool-portable.zip
+# Output: dist/windows/下载器/  and  dist/windows/下载器-portable.zip
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
 $Dist = Join-Path $Root "dist\windows"
-$Out = Join-Path $Dist "download-tool"
-$Zip = Join-Path $Dist "download-tool-portable.zip"
+$AppName = "下载器"
+$Out = Join-Path $Dist $AppName
+$Zip = Join-Path $Dist "$AppName-portable.zip"
 
 New-Item -ItemType Directory -Force -Path $Dist | Out-Null
 if (Test-Path $Out) { Remove-Item -Recurse -Force $Out }
@@ -22,7 +23,7 @@ if (-not (Test-Path $Exe)) {
   throw "release binary not found: $Exe"
 }
 
-Copy-Item $Exe (Join-Path $Out "download-tool.exe")
+Copy-Item $Exe (Join-Path $Out "$AppName.exe")
 
 $Aria = Get-Command aria2c.exe -ErrorAction SilentlyContinue
 if (-not $Aria) {
@@ -53,10 +54,10 @@ if (-not $CaCopied) {
 
 使用方法：
 1. 解压本文件夹到任意目录（如桌面）
-2. 双击 download-tool.exe 即可使用，无需安装
+2. 双击 下载器.exe 即可使用，无需安装
 3. 首次运行会注册 dltool://（当前用户），并写入登录启动（如已启用）
 
-依赖文件需与 download-tool.exe 放在同一目录：
+依赖文件需与 下载器.exe 放在同一目录：
 - aria2c.exe
 - cacert.pem 或 curl-ca-bundle.crt
 "@ | Set-Content -Encoding UTF8 (Join-Path $Out "使用说明.txt")
@@ -66,4 +67,4 @@ Compress-Archive -Path $Out -DestinationPath $Zip -Force
 Write-Host ""
 Write-Host "Folder: $Out"
 Write-Host "Zip:    $Zip"
-Write-Host "解压后双击 download-tool.exe 即可，无需安装。"
+Write-Host "解压后双击 下载器.exe 即可，无需安装。"
