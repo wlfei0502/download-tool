@@ -2,8 +2,8 @@
 //!
 //! The first process holds a [`single_instance::SingleInstance`] named
 //! `download-tool-dltool` until it exits. A later process posts any http
-//! download, or a simple `dltool://add` URL, to `POST /v1/tasks`, asks the
-//! existing window to come forward, and returns so the caller can exit 0.
+//! download, or a `dltool://add` URL, to `POST /v1/tasks`, asks the existing
+//! window to come forward, and returns so the caller can exit 0.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use download_core::task::require_http_url;
+use download_core::protocol::{parse_dltool_url, suggested_file_name};
+use download_core::task::{require_http_url, NewTaskRequest};
 use download_local_api::DEFAULT_PORT;
 
 pub const INSTANCE_NAME: &str = "download-tool-dltool";
@@ -78,13 +79,6 @@ impl Default for Activation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ForwardedTask {
-    pub url: String,
-    pub file_name: String,
-    pub size: Option<u64>,
-}
-
 /// Acquire the process lock. The primary must keep [`InstanceLock`] alive.
 pub fn claim() -> Result<Launch, String> {
     claim_name(&lock_id())
@@ -115,7 +109,7 @@ pub(crate) fn forward_args_timeout(
     args: &[String],
     timeout: Duration,
 ) -> Result<(), String> {
-    let tasks = tasks_from_args(args);
+    let tasks = requests_from_args(args);
     let deadline = Instant::now() + timeout;
     let mut last = format!("127.0.0.1:{port} is not accepting connections");
     loop {
@@ -141,12 +135,11 @@ pub(crate) fn forward_args_timeout(
     }
 }
 
-/// http URLs and simple `dltool://add?...` arguments. Other argv is ignored.
-/// Full `dltool://` parsing is a later task.
-pub(crate) fn tasks_from_args(args: &[String]) -> Vec<ForwardedTask> {
+/// http URLs and `dltool://add?...` arguments. Other argv is ignored.
+pub(crate) fn requests_from_args(args: &[String]) -> Vec<NewTaskRequest> {
     let mut tasks = Vec::new();
     for arg in args {
-        let arg = arg.trim();
+        let arg = arg.trim().trim_matches('"');
         if arg.is_empty() || arg.starts_with('-') {
             continue;
         }
@@ -177,15 +170,23 @@ fn lock_id() -> String {
     }
 }
 
-fn task_from_arg(arg: &str) -> Option<ForwardedTask> {
+fn task_from_arg(arg: &str) -> Option<NewTaskRequest> {
     if is_dltool(arg) {
-        return task_from_dltool(arg);
+        return match parse_dltool_url(arg) {
+            Ok(request) => Some(request),
+            Err(err) => {
+                eprintln!("skipped dltool url: {err}");
+                None
+            }
+        };
     }
     if require_http_url(arg).is_ok() {
-        return Some(ForwardedTask {
-            file_name: file_name_from_http_url(arg),
+        return Some(NewTaskRequest {
+            file_name: suggested_file_name(arg),
             url: arg.to_string(),
             size: None,
+            referrer: None,
+            user_agent: None,
         });
     }
     None
@@ -202,84 +203,12 @@ fn looks_like_url(arg: &str) -> bool {
     arg.contains("://")
 }
 
-fn task_from_dltool(arg: &str) -> Option<ForwardedTask> {
-    let query = arg.split_once('?').map(|(_, query)| query).unwrap_or("");
-    let mut url = None;
-    let mut file_name = None;
-    let mut size = None;
-    for pair in query.split('&') {
-        if pair.is_empty() {
-            continue;
-        }
-        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        let value = percent_decode(value);
-        match key {
-            "url" => url = Some(value),
-            "fileName" => file_name = Some(value),
-            "size" => size = value.parse().ok(),
-            _ => {}
-        }
-    }
-    let url = url.filter(|url| require_http_url(url).is_ok())?;
-    let file_name = file_name
-        .filter(|name| safe_file_name(name))
-        .unwrap_or_else(|| file_name_from_http_url(&url));
-    Some(ForwardedTask {
-        url,
-        file_name,
-        size,
-    })
-}
-
-fn file_name_from_http_url(url: &str) -> String {
-    let without_fragment = url.split('#').next().unwrap_or(url);
-    let path = without_fragment
-        .split('?')
-        .next()
-        .unwrap_or(without_fragment);
-    let segment = path.rsplit('/').next().unwrap_or("");
-    let name = percent_decode(segment);
-    if safe_file_name(&name) {
-        name
-    } else {
-        "download".to_string()
-    }
-}
-
-fn safe_file_name(name: &str) -> bool {
-    !name.is_empty()
-        && name != "."
-        && name != ".."
-        && !name.contains('/')
-        && !name.contains('\\')
-        && !name.contains('\0')
-}
-
-fn percent_decode(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or("");
-            if let Ok(byte) = u8::from_str_radix(hex, 16) {
-                out.push(byte);
-                index += 3;
-                continue;
-            }
-        }
-        out.push(bytes[index]);
-        index += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 enum ForwardError {
     Unreachable(String),
     Rejected(String),
 }
 
-fn forward_once(port: u16, tasks: &[ForwardedTask]) -> Result<(), ForwardError> {
+fn forward_once(port: u16, tasks: &[NewTaskRequest]) -> Result<(), ForwardError> {
     let mut rejected = None;
     for task in tasks {
         if let Err(err) = post_json(port, "/v1/tasks", &task_json(task)) {
@@ -300,13 +229,19 @@ fn forward_once(port: u16, tasks: &[ForwardedTask]) -> Result<(), ForwardError> 
     Ok(())
 }
 
-fn task_json(task: &ForwardedTask) -> Vec<u8> {
+fn task_json(task: &NewTaskRequest) -> Vec<u8> {
     let mut body = serde_json::json!({
         "url": task.url,
         "fileName": task.file_name,
     });
     if let Some(size) = task.size {
         body["size"] = serde_json::json!(size);
+    }
+    if let Some(referrer) = &task.referrer {
+        body["referrer"] = serde_json::json!(referrer);
+    }
+    if let Some(user_agent) = &task.user_agent {
+        body["userAgent"] = serde_json::json!(user_agent);
     }
     serde_json::to_vec(&body).expect("forwarded task is valid json")
 }
@@ -361,7 +296,7 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        claim_name, forward_args, forward_args_timeout, tasks_from_args, Activation, Launch,
+        claim_name, forward_args, forward_args_timeout, requests_from_args, Activation, Launch,
         INSTANCE_NAME,
     };
 
@@ -430,7 +365,7 @@ mod tests {
 
     #[test]
     fn collects_http_and_simple_dltool_args() {
-        let tasks = tasks_from_args(&args(&[
+        let tasks = requests_from_args(&args(&[
             "http://example.com/files/a.zip",
             "--flag",
             "dltool://add?url=http%3A%2F%2Fhost%2Fd%2Ft&fileName=a.zip&size=9",
@@ -448,19 +383,29 @@ mod tests {
 
     #[test]
     fn derives_a_file_name_and_skips_a_dltool_url_without_http() {
-        let bare = tasks_from_args(&args(&["http://example.com/a%20b.zip?x=1"]));
+        let bare = requests_from_args(&args(&["http://example.com/a%20b.zip?x=1"]));
         assert_eq!(bare[0].file_name, "a b.zip");
 
-        let directory = tasks_from_args(&args(&["http://example.com/"]));
+        let directory = requests_from_args(&args(&["http://example.com/"]));
         assert_eq!(directory[0].file_name, "download");
 
-        let missing = tasks_from_args(&args(&[
+        let missing = requests_from_args(&args(&[
             "dltool://add?url=https%3A%2F%2Fhost%2Fa",
             "DLTOOL://add?url=http://example.com/from-scheme.bin",
         ]));
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].url, "http://example.com/from-scheme.bin");
         assert_eq!(missing[0].file_name, "from-scheme.bin");
+    }
+
+    #[test]
+    fn dltool_args_keep_referrer_and_user_agent() {
+        let tasks = requests_from_args(&args(&[
+            "dltool://add?url=http%3A%2F%2Fhost%2Fa&fileName=a.bin&referrer=http%3A%2F%2Fhost%2Ffiles&userAgent=Mozilla%2F5.0",
+        ]));
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].referrer.as_deref(), Some("http://host/files"));
+        assert_eq!(tasks[0].user_agent.as_deref(), Some("Mozilla/5.0"));
     }
 
     #[test]

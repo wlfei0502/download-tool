@@ -1,3 +1,4 @@
+mod platform;
 mod single_instance;
 mod tray;
 mod ui;
@@ -51,6 +52,15 @@ fn try_main() -> anyhow::Result<()> {
         single_instance::Launch::Primary(instance) => instance,
     };
 
+    match std::env::current_exe() {
+        Ok(exe) => {
+            if let Err(err) = platform::register_protocol(&exe) {
+                eprintln!("dltool:// protocol was not registered: {err}");
+            }
+        }
+        Err(err) => eprintln!("dltool:// protocol was not registered: {err}"),
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -76,7 +86,7 @@ async fn prepare(activation: Activation) -> Result<DownloadUi, String> {
     let save_dir = default_save_dir();
     let save_dir_text = save_dir.to_string_lossy().to_string();
     let tasks = Arc::new(Mutex::new(TaskManager::new()));
-    let (child, engine, banner) = start_backend(&save_dir, Arc::clone(&tasks)).await;
+    let (child, mut engine, banner) = start_backend(&save_dir, Arc::clone(&tasks)).await;
     if let Some(banner) = &banner {
         eprintln!("{banner}");
     }
@@ -95,6 +105,13 @@ async fn prepare(activation: Activation) -> Result<DownloadUi, String> {
 
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
     let model = SharedModel::new();
+    let startup: Vec<String> = std::env::args().skip(1).collect();
+    enqueue_requests(
+        &mut engine,
+        &tasks,
+        single_instance::requests_from_args(&startup),
+    )
+    .await;
     let engine_dir = save_dir_text.clone();
     tokio::spawn(run_engine(
         engine,
@@ -469,6 +486,24 @@ async fn control(
     }
 }
 
+async fn enqueue_requests(
+    engine: &mut Option<DownloadEngine<Aria2Client>>,
+    tasks: &Arc<Mutex<TaskManager>>,
+    requests: Vec<NewTaskRequest>,
+) {
+    for request in requests {
+        let label = request.file_name.clone();
+        let result = if let Some(engine) = engine.as_mut() {
+            engine.submit(request).await.map(|_| ())
+        } else {
+            tasks.lock().await.add(request).map(|_| ())
+        };
+        if let Err(err) = result {
+            eprintln!("could not enqueue {label}: {err}");
+        }
+    }
+}
+
 async fn start_queued(
     engine: &mut DownloadEngine<Aria2Client>,
     save_dir: &str,
@@ -520,7 +555,8 @@ mod tests {
     use download_core::aria2::rpc::Aria2Client;
 
     use super::{
-        api_listen_addr, api_router, bind_api, control, pause_all, retry_until_rpc_ready, Control,
+        api_listen_addr, api_router, bind_api, control, enqueue_requests, pause_all,
+        retry_until_rpc_ready, Control,
     };
     use crate::single_instance::Activation;
     use download_core::manager::TaskManager;
@@ -727,6 +763,26 @@ mod tests {
             tasks.lock().await.get(&queued).expect("requeued").status,
             TaskStatus::Queued
         );
+    }
+
+    #[tokio::test]
+    async fn startup_urls_are_queued_when_aria2_is_absent() {
+        let tasks = Arc::new(Mutex::new(TaskManager::new()));
+        let requests = crate::single_instance::requests_from_args(&[
+            "dltool://add?url=http%3A%2F%2Fhost%2Fd%2Ft&fileName=a.zip&size=9".into(),
+            "http://example.com/plain.bin".into(),
+            "https://example.com/nope".into(),
+        ]);
+        let mut engine = None;
+        enqueue_requests(&mut engine, &tasks, requests).await;
+        let mut listed = tasks.lock().await.list();
+        listed.sort_by(|left, right| left.file_name.cmp(&right.file_name));
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].file_name, "a.zip");
+        assert_eq!(listed[0].url, "http://host/d/t");
+        assert_eq!(listed[0].size, Some(9));
+        assert_eq!(listed[1].file_name, "plain.bin");
+        assert_eq!(listed[1].url, "http://example.com/plain.bin");
     }
 
     fn request(url: &str, file_name: &str) -> NewTaskRequest {
