@@ -1,10 +1,11 @@
+use std::path::Path;
 use std::process::Child;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use download_core::protocol::suggested_file_name;
 use download_core::settings::Settings;
 use download_core::task::{require_http_url, DownloadTask, TaskId, TaskStatus};
-use download_local_api::DEFAULT_PORT;
 use tokio::sync::mpsc;
 
 pub enum Command {
@@ -16,6 +17,7 @@ pub enum Command {
     Pause(TaskId),
     Resume(TaskId),
     Cancel(TaskId),
+    ClearAll,
     PauseAll,
     UpdateSettings(Settings),
 }
@@ -65,10 +67,11 @@ impl SharedModel {
 pub struct DownloadUi {
     url: String,
     file_name: String,
+    /// Last name filled from the URL; used so edits are kept when the URL changes.
+    auto_file_name: String,
     save_dir: String,
     speed_limit: String,
     max_connections: String,
-    autostart: bool,
     banner: Option<String>,
     model: SharedModel,
     commands: mpsc::UnboundedSender<Command>,
@@ -95,9 +98,9 @@ impl DownloadUi {
         Self {
             url: String::new(),
             file_name: String::new(),
+            auto_file_name: String::new(),
             speed_limit: format_speed_limit_kbps(settings.global_speed_limit_bps),
             max_connections: settings.max_connections_per_server.to_string(),
-            autostart: settings.autostart,
             save_dir: settings.save_dir,
             banner,
             model,
@@ -155,8 +158,18 @@ impl DownloadUi {
         }
     }
 
+    fn sync_file_name_from_url(&mut self) {
+        if let Some((name, auto)) =
+            next_auto_file_name(&self.url, &self.file_name, &self.auto_file_name)
+        {
+            self.file_name = name;
+            self.auto_file_name = auto;
+        }
+    }
+
     fn submit_add(&mut self) {
         let url = self.url.trim().to_string();
+        self.sync_file_name_from_url();
         let file_name = self.file_name.trim().to_string();
         if let Err(err) = validate_task_input(&url, &file_name) {
             self.model.set_notice(Some(err));
@@ -176,11 +189,24 @@ impl DownloadUi {
             .is_err()
         {
             self.model
-                .set_notice(Some("download engine has stopped".into()));
+                .set_notice(Some("下载引擎已停止".into()));
             return;
         }
         self.url.clear();
         self.file_name.clear();
+        self.auto_file_name.clear();
+    }
+
+    fn browse_save_dir(&mut self) {
+        let mut dialog = rfd::FileDialog::new().set_title("选择保存目录");
+        let current = self.save_dir.trim();
+        if !current.is_empty() {
+            dialog = dialog.set_directory(current);
+        }
+        if let Some(path) = dialog.pick_folder() {
+            self.save_dir = path.to_string_lossy().into_owned();
+            self.commit_settings();
+        }
     }
 
     /// Persists the settings fields. Returns false when a field is invalid.
@@ -188,7 +214,7 @@ impl DownloadUi {
         let save_dir = self.save_dir.trim().to_string();
         if save_dir.is_empty() {
             self.model
-                .set_notice(Some("save directory required".into()));
+                .set_notice(Some("请选择保存目录".into()));
             return false;
         }
         let global_speed_limit_bps = match parse_speed_limit_kbps(&self.speed_limit) {
@@ -210,7 +236,7 @@ impl DownloadUi {
             save_dir,
             global_speed_limit_bps,
             max_connections_per_server,
-            autostart: self.autostart,
+            autostart: true,
         }));
         true
     }
@@ -218,7 +244,7 @@ impl DownloadUi {
     fn send(&self, command: Command) {
         if self.commands.send(command).is_err() {
             self.model
-                .set_notice(Some("download engine has stopped".into()));
+                .set_notice(Some("下载引擎已停止".into()));
         }
     }
 }
@@ -242,8 +268,6 @@ impl eframe::App for DownloadUi {
         let (tasks, notice) = self.model.view();
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Download Tool");
-            ui.add_space(6.0);
             if let Some(banner) = &self.banner {
                 ui.colored_label(egui::Color32::from_rgb(255, 186, 92), banner);
                 ui.add_space(8.0);
@@ -253,67 +277,52 @@ impl eframe::App for DownloadUi {
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("Save directory");
-                    let save = ui.add(
-                        egui::TextEdit::singleline(&mut self.save_dir)
-                            .desired_width(520.0)
-                            .hint_text("/path/to/downloads"),
-                    );
-                    if field_committed(&save, ui) {
-                        self.commit_settings();
-                    }
+                    ui.label("保存目录");
+                    ui.horizontal(|ui| {
+                        let save = ui.add(
+                            egui::TextEdit::singleline(&mut self.save_dir)
+                                .desired_width(440.0)
+                                .hint_text("选择或输入保存路径"),
+                        );
+                        if field_committed(&save, ui) {
+                            self.commit_settings();
+                        }
+                        if ui.button("浏览…").clicked() {
+                            self.browse_save_dir();
+                        }
+                    });
                     ui.end_row();
 
-                    ui.label("Speed limit (KB/s)");
-                    let speed = ui.add(
-                        egui::TextEdit::singleline(&mut self.speed_limit)
-                            .desired_width(160.0)
-                            .hint_text("empty = unlimited"),
-                    );
-                    if field_committed(&speed, ui) {
-                        self.commit_settings();
-                    }
-                    ui.end_row();
-
-                    ui.label("Connections per server");
-                    let connections = ui.add(
-                        egui::TextEdit::singleline(&mut self.max_connections)
-                            .desired_width(80.0)
-                            .hint_text("1–16"),
-                    );
-                    if field_committed(&connections, ui) {
-                        self.commit_settings();
-                    }
-                    ui.end_row();
-
-                    ui.label("Start at login");
-                    let previous_autostart = self.autostart;
-                    if ui
-                        .checkbox(&mut self.autostart, "Open when I log in")
-                        .changed()
-                        && !self.commit_settings()
-                    {
-                        self.autostart = previous_autostart;
-                    }
-                    ui.end_row();
-
-                    ui.label("URL");
-                    ui.add(
+                    ui.label("下载地址");
+                    let url_edit = ui.add(
                         egui::TextEdit::singleline(&mut self.url)
                             .desired_width(520.0)
-                            .hint_text("http://example.com/file.zip"),
+                            .hint_text("http(s)://example.com/file.zip"),
                     );
+                    if url_edit.changed() {
+                        self.sync_file_name_from_url();
+                    }
                     ui.end_row();
 
-                    ui.label("File name");
+                    ui.label("文件名");
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.file_name)
                                 .desired_width(420.0)
                                 .hint_text("file.zip"),
                         );
-                        if ui.button("Add").clicked() {
+                        let start = ui.add(
+                            egui::Button::new(
+                                egui::RichText::new("开始下载").color(egui::Color32::WHITE),
+                            )
+                            .fill(egui::Color32::from_rgb(37, 99, 235)),
+                        );
+                        if start.clicked() {
                             self.submit_add();
+                        }
+                        let clear = ui.add_enabled(!tasks.is_empty(), egui::Button::new("清空"));
+                        if clear.clicked() {
+                            self.send(Command::ClearAll);
                         }
                     });
                     ui.end_row();
@@ -326,73 +335,138 @@ impl eframe::App for DownloadUi {
 
             ui.add_space(8.0);
             ui.separator();
-            ui.heading("Tasks");
-            ui.label(format!("Local API  http://127.0.0.1:{DEFAULT_PORT}"));
             ui.add_space(4.0);
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 if tasks.is_empty() {
-                    ui.label("No downloads yet.");
+                    ui.label("暂无下载任务。");
                     return;
                 }
-                task_table(ui, &tasks, |command| self.send(command));
+                let save_dir = self.save_dir.clone();
+                let mut open_notice = None;
+                task_table(ui, &tasks, &save_dir, |command| self.send(command), |msg| {
+                    open_notice = Some(msg);
+                });
+                if let Some(msg) = open_notice {
+                    self.model.set_notice(Some(msg));
+                }
             });
         });
     }
 }
 
-fn task_table(ui: &mut egui::Ui, tasks: &[DownloadTask], mut send: impl FnMut(Command)) {
+fn task_table(
+    ui: &mut egui::Ui,
+    tasks: &[DownloadTask],
+    save_dir: &str,
+    mut send: impl FnMut(Command),
+    mut on_notice: impl FnMut(String),
+) {
     egui::Grid::new("tasks")
         .striped(true)
-        .num_columns(5)
+        .num_columns(6)
         .spacing([16.0, 8.0])
         .show(ui, |ui| {
-            ui.strong("File");
-            ui.strong("Status");
-            ui.strong("Progress");
-            ui.strong("Speed");
-            ui.strong("Actions");
+            ui.strong("文件");
+            ui.strong("状态");
+            ui.strong("进度");
+            ui.strong("速度");
+            ui.strong("时间");
+            ui.strong("操作");
             ui.end_row();
 
             for task in tasks {
-                ui.label(&task.file_name).on_hover_text(&task.url);
+                file_name_cell(ui, task, save_dir, &mut on_notice);
                 ui.vertical(|ui| {
-                    ui.label(status_name(task.status));
+                    ui.label(
+                        egui::RichText::new(status_name(task.status))
+                            .color(status_color(task.status)),
+                    );
                     if let Some(err) = &task.error {
                         ui.label(
-                            egui::RichText::new(err)
+                            egui::RichText::new(localize_engine_message(err))
                                 .small()
-                                .color(egui::Color32::from_rgb(255, 140, 120)),
+                                .color(egui::Color32::from_rgb(220, 38, 38)),
                         );
                     }
                 });
                 progress_cell(ui, task);
                 ui.label(speed_text(task));
+                ui.monospace(format_task_created_at(task.created_at));
                 ui.push_id(&task.id.0, |ui| {
                     ui.horizontal(|ui| {
                         let pause = task.status == TaskStatus::Active;
                         let resume = task.status == TaskStatus::Paused;
                         let cancel = can_cancel(task);
-                        if ui.add_enabled(pause, egui::Button::new("Pause")).clicked() {
+                        if ui.add_enabled(pause, egui::Button::new("暂停")).clicked() {
                             send(Command::Pause(task.id.clone()));
                         }
                         if ui
-                            .add_enabled(resume, egui::Button::new("Resume"))
+                            .add_enabled(resume, egui::Button::new("继续"))
                             .clicked()
                         {
                             send(Command::Resume(task.id.clone()));
                         }
                         if ui
-                            .add_enabled(cancel, egui::Button::new("Cancel"))
+                            .add_enabled(cancel, egui::Button::new("取消"))
                             .clicked()
                         {
                             send(Command::Cancel(task.id.clone()));
+                        }
+                        let file_path = Path::new(save_dir).join(&task.file_name);
+                        let can_copy = task.status == TaskStatus::Complete && file_path.is_file();
+                        if ui
+                            .add_enabled(can_copy, egui::Button::new("复制"))
+                            .on_hover_text("复制已下载的文件")
+                            .clicked()
+                        {
+                            match crate::platform::copy_file_to_clipboard(&file_path) {
+                                Ok(()) => on_notice("已复制文件，可粘贴到文件夹".into()),
+                                Err(err) => on_notice(format!("无法复制文件：{err}")),
+                            }
                         }
                     });
                 });
                 ui.end_row();
             }
         });
+}
+
+fn format_task_created_at(secs: u64) -> String {
+    use chrono::{Local, TimeZone};
+    Local
+        .timestamp_opt(secs as i64, 0)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "—".into())
+}
+
+fn file_name_cell(
+    ui: &mut egui::Ui,
+    task: &DownloadTask,
+    save_dir: &str,
+    on_notice: &mut impl FnMut(String),
+) {
+    if task.status == TaskStatus::Complete {
+        let response = ui
+            .add(
+                egui::Label::new(
+                    egui::RichText::new(&task.file_name)
+                        .color(egui::Color32::from_rgb(37, 99, 235)),
+                )
+                .sense(egui::Sense::click()),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .on_hover_text("打开所在目录");
+        if response.clicked() {
+            let path = Path::new(save_dir).join(&task.file_name);
+            if let Err(err) = crate::platform::reveal_in_folder(&path) {
+                on_notice(format!("无法打开目录：{err}"));
+            }
+        }
+        return;
+    }
+    ui.label(&task.file_name).on_hover_text(&task.url);
 }
 
 fn progress_cell(ui: &mut egui::Ui, task: &DownloadTask) {
@@ -414,11 +488,34 @@ fn progress_cell(ui: &mut egui::Ui, task: &DownloadTask) {
 
 fn status_name(status: TaskStatus) -> &'static str {
     match status {
-        TaskStatus::Queued => "Queued",
-        TaskStatus::Active => "Active",
-        TaskStatus::Paused => "Paused",
-        TaskStatus::Complete => "Complete",
-        TaskStatus::Error => "Error",
+        TaskStatus::Queued => "排队中",
+        TaskStatus::Active => "下载中",
+        TaskStatus::Paused => "已暂停",
+        TaskStatus::Complete => "已完成",
+        TaskStatus::Error => "失败",
+    }
+}
+
+fn status_color(status: TaskStatus) -> egui::Color32 {
+    match status {
+        TaskStatus::Queued => egui::Color32::from_rgb(107, 114, 128),
+        TaskStatus::Active => egui::Color32::from_rgb(37, 99, 235),
+        TaskStatus::Paused => egui::Color32::from_rgb(217, 119, 6),
+        TaskStatus::Complete => egui::Color32::from_rgb(22, 163, 74),
+        TaskStatus::Error => egui::Color32::from_rgb(220, 38, 38),
+    }
+}
+
+fn localize_engine_message(message: &str) -> String {
+    match message {
+        "cancelled" => "已取消".into(),
+        "url required" => "请填写下载地址".into(),
+        "only http:// and https:// URLs are allowed" => "仅支持 http:// 或 https:// 地址".into(),
+        "only http:// URLs are allowed" => "仅支持 http:// 或 https:// 地址".into(),
+        "url must not include user info" => "地址不能包含用户名和密码".into(),
+        "task not found" => "任务不存在".into(),
+        "task has no gid" => "任务尚未开始".into(),
+        other => other.to_string(),
     }
 }
 
@@ -457,17 +554,17 @@ pub fn parse_speed_limit_kbps(text: &str) -> Result<Option<u64>, String> {
         return Ok(None);
     }
     if !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("speed limit must be a whole number of KB/s".into());
+        return Err("限速必须是整数（KB/s）".into());
     }
     let kbps: u64 = text
         .parse()
-        .map_err(|_| "speed limit must be a whole number of KB/s".to_string())?;
+        .map_err(|_| "限速必须是整数（KB/s）".to_string())?;
     if kbps == 0 {
         return Ok(None);
     }
     kbps.checked_mul(1024)
         .map(Some)
-        .ok_or_else(|| "speed limit is too large".into())
+        .ok_or_else(|| "限速数值过大".into())
 }
 
 pub fn format_speed_limit_kbps(limit_bps: Option<u64>) -> String {
@@ -489,26 +586,47 @@ pub fn parse_max_connections(text: &str) -> Result<u8, String> {
     if (1..=16).contains(&value) {
         Ok(value as u8)
     } else {
-        Err("connections per server must be from 1 to 16".into())
+        Err("并行数须为 1–16".into())
     }
 }
 
 pub fn can_cancel(task: &DownloadTask) -> bool {
-    if task.gid.is_none() {
-        return matches!(task.status, TaskStatus::Queued | TaskStatus::Error);
+    // Finished rows are removable too (aria2 uses removeDownloadResult).
+    match task.status {
+        TaskStatus::Queued | TaskStatus::Error | TaskStatus::Complete => true,
+        TaskStatus::Active | TaskStatus::Paused => task.gid.is_some(),
     }
-    matches!(task.status, TaskStatus::Active | TaskStatus::Paused)
 }
 
 pub fn validate_task_input(url: &str, file_name: &str) -> Result<(), String> {
-    require_http_url(url)?;
+    require_http_url(url).map_err(|err| localize_engine_message(&err))?;
     if file_name.is_empty() || file_name == "." || file_name == ".." {
-        return Err("file name required".into());
+        return Err("请填写文件名".into());
     }
     if file_name.contains('/') || file_name.contains('\\') || file_name.contains('\0') {
-        return Err("file name must not include a path".into());
+        return Err("文件名不能包含路径".into());
     }
     Ok(())
+}
+
+/// When the file-name field is empty or still equal to the last auto value,
+/// returns `(new_file_name, new_auto_file_name)` derived from `url`.
+fn next_auto_file_name(
+    url: &str,
+    file_name: &str,
+    auto_file_name: &str,
+) -> Option<(String, String)> {
+    let url = url.trim();
+    if url.is_empty() {
+        return None;
+    }
+    let suggested = suggested_file_name(url);
+    let current = file_name.trim();
+    if current.is_empty() || current == auto_file_name {
+        Some((suggested.clone(), suggested))
+    } else {
+        None
+    }
 }
 
 pub struct ErrorScreen {
@@ -530,11 +648,11 @@ impl ErrorScreen {
 impl eframe::App for ErrorScreen {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("Download Tool could not start");
+            ui.heading("下载器无法启动");
             ui.add_space(12.0);
             ui.label(&self.message);
             ui.add_space(16.0);
-            if ui.button("Quit").clicked() {
+            if ui.button("退出").clicked() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
@@ -543,9 +661,10 @@ impl eframe::App for ErrorScreen {
 
 pub fn run(mut app: DownloadUi) -> eframe::Result<()> {
     eframe::run_native(
-        "Download Tool",
-        native_options("Download Tool", [980.0, 680.0]),
+        "下载器",
+        native_options("下载器", [980.0, 680.0]),
         Box::new(move |cc| {
+            crate::fonts::configure_fonts(&cc.egui_ctx);
             // The winit loop is already running here, which tray-icon requires
             // before a status item is created (especially on macOS).
             app.install_tray(&cc.egui_ctx);
@@ -566,9 +685,12 @@ pub fn run_error(
 ) -> eframe::Result<()> {
     let message = message.to_string();
     eframe::run_native(
-        "Download Tool",
-        native_options("Download Tool", [560.0, 240.0]),
-        Box::new(move |_cc| Ok(Box::new(ErrorScreen::new(message, instance)))),
+        "下载器",
+        native_options("下载器", [560.0, 240.0]),
+        Box::new(move |cc| {
+            crate::fonts::configure_fonts(&cc.egui_ctx);
+            Ok(Box::new(ErrorScreen::new(message, instance)))
+        }),
     )
 }
 
@@ -585,8 +707,8 @@ fn native_options(title: &str, size: [f32; 2]) -> eframe::NativeOptions {
 #[cfg(test)]
 mod tests {
     use super::{
-        can_cancel, format_bytes, format_speed_limit_kbps, parse_max_connections,
-        parse_speed_limit_kbps, validate_task_input,
+        can_cancel, format_bytes, format_speed_limit_kbps, format_task_created_at,
+        next_auto_file_name, parse_max_connections, parse_speed_limit_kbps, validate_task_input,
     };
     use download_core::task::{DownloadTask, NewTaskRequest, TaskStatus};
 
@@ -607,33 +729,68 @@ mod tests {
     fn rejects_empty_url_and_path_file_names() {
         assert_eq!(
             validate_task_input("", "a.zip").unwrap_err(),
-            "url required"
+            "请填写下载地址"
         );
-        assert!(validate_task_input("http://example.com/a", "").is_err());
+        assert_eq!(
+            validate_task_input("http://example.com/a", "").unwrap_err(),
+            "请填写文件名"
+        );
         assert!(validate_task_input("http://example.com/a", "../secret").is_err());
         assert!(validate_task_input("http://example.com/a", "a/b.zip").is_err());
         assert!(validate_task_input("http://example.com/a", "a.zip").is_ok());
     }
 
     #[test]
-    fn rejects_non_http_urls_and_accepts_http() {
-        assert_eq!(
-            validate_task_input("https://example.com/a", "a.zip").unwrap_err(),
-            "only http:// URLs are allowed"
-        );
-        assert_eq!(
-            validate_task_input("HTTPS://example.com/a", "a.zip").unwrap_err(),
-            "only http:// URLs are allowed"
-        );
+    fn formats_created_at_as_local_datetime() {
+        let text = format_task_created_at(1_700_000_000);
+        assert_eq!(text.len(), "yyyy-mm-dd hh:mm:ss".len());
+        assert!(text.chars().nth(4) == Some('-'));
+        assert!(text.chars().nth(7) == Some('-'));
+        assert!(text.chars().nth(10) == Some(' '));
+        assert!(text.chars().nth(13) == Some(':'));
+        assert!(text.chars().nth(16) == Some(':'));
+    }
+
+    #[test]
+    fn fills_file_name_from_url_until_user_edits_it() {
+        let (name, auto) =
+            next_auto_file_name("https://host/path/aria2-1.37.0.zip", "", "").unwrap();
+        assert_eq!(name, "aria2-1.37.0.zip");
+        assert_eq!(auto, "aria2-1.37.0.zip");
+
+        let (name, _) = next_auto_file_name(
+            "https://host/other/b.bin",
+            "aria2-1.37.0.zip",
+            "aria2-1.37.0.zip",
+        )
+        .unwrap();
+        assert_eq!(name, "b.bin");
+
+        assert!(next_auto_file_name(
+            "https://host/other/b.bin",
+            "custom.bin",
+            "aria2-1.37.0.zip",
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn rejects_non_http_urls_and_accepts_http_https() {
         assert_eq!(
             validate_task_input("ftp://example.com/a", "a.zip").unwrap_err(),
-            "only http:// URLs are allowed"
+            "仅支持 http:// 或 https:// 地址"
         );
         assert!(validate_task_input("http://example.com/a", "a.zip").is_ok());
         assert!(validate_task_input("HTTP://example.com/a", "a.zip").is_ok());
+        assert!(validate_task_input("https://example.com/a", "a.zip").is_ok());
+        assert!(validate_task_input("HTTPS://example.com/a", "a.zip").is_ok());
         assert_eq!(
             validate_task_input("http://user:pass@example.com/a", "a.zip").unwrap_err(),
-            "url must not include user info"
+            "地址不能包含用户名和密码"
+        );
+        assert_eq!(
+            validate_task_input("https://user:pass@example.com/a", "a.zip").unwrap_err(),
+            "地址不能包含用户名和密码"
         );
     }
 
@@ -641,11 +798,12 @@ mod tests {
     fn cancel_enabled_for_queued_and_error_without_gid() {
         assert!(can_cancel(&task(TaskStatus::Queued, None)));
         assert!(can_cancel(&task(TaskStatus::Error, None)));
+        assert!(can_cancel(&task(TaskStatus::Complete, None)));
+        assert!(can_cancel(&task(TaskStatus::Complete, Some("gid-1"))));
+        assert!(can_cancel(&task(TaskStatus::Error, Some("gid-1"))));
         assert!(can_cancel(&task(TaskStatus::Active, Some("gid-1"))));
         assert!(can_cancel(&task(TaskStatus::Paused, Some("gid-1"))));
         assert!(!can_cancel(&task(TaskStatus::Active, None)));
-        assert!(!can_cancel(&task(TaskStatus::Complete, None)));
-        assert!(!can_cancel(&task(TaskStatus::Error, Some("gid-1"))));
     }
 
     #[test]

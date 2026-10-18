@@ -58,7 +58,7 @@ fn missing_file_loads_defaults() {
     assert_eq!(settings, Settings::default());
     assert_eq!(settings.max_connections_per_server, 8);
     assert_eq!(settings.global_speed_limit_bps, None);
-    assert!(!settings.autostart);
+    assert!(settings.autostart);
     assert!(settings.save_dir.is_empty());
 }
 
@@ -77,7 +77,7 @@ fn missing_fields_use_defaults_and_limits_are_normalized() {
     assert_eq!(settings.save_dir, "/data");
     assert_eq!(settings.global_speed_limit_bps, None);
     assert_eq!(settings.max_connections_per_server, 16);
-    assert!(!settings.autostart);
+    assert!(settings.autostart);
 
     std::fs::write(&path, r#"{"max_connections_per_server":0}"#).expect("write zero");
     let clamped = Settings::load(&path).expect("zero connections");

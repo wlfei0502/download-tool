@@ -67,4 +67,18 @@ impl TaskManager {
         self.by_url.retain(|_, existing| existing != id);
         Ok(())
     }
+
+    /// Inserts a previously persisted task (keeps its id). Skips duplicates.
+    pub fn restore(&mut self, task: DownloadTask) -> Result<(), String> {
+        if self.tasks.contains_key(&task.id) {
+            return Ok(());
+        }
+        if self.by_url.contains_key(&task.url) {
+            return Ok(());
+        }
+        require_http_url(&task.url)?;
+        self.by_url.insert(task.url.clone(), task.id.clone());
+        self.tasks.insert(task.id.clone(), task);
+        Ok(())
+    }
 }

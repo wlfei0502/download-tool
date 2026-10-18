@@ -369,33 +369,39 @@ mod tests {
             "http://example.com/files/a.zip",
             "--flag",
             "dltool://add?url=http%3A%2F%2Fhost%2Fd%2Ft&fileName=a.zip&size=9",
-            "https://example.com/nope",
+            "https://example.com/secure.bin",
+            "ftp://example.com/nope",
             "notes.txt",
         ]));
-        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks.len(), 3);
         assert_eq!(tasks[0].url, "http://example.com/files/a.zip");
         assert_eq!(tasks[0].file_name, "a.zip");
         assert_eq!(tasks[0].size, None);
         assert_eq!(tasks[1].url, "http://host/d/t");
         assert_eq!(tasks[1].file_name, "a.zip");
         assert_eq!(tasks[1].size, Some(9));
+        assert_eq!(tasks[2].url, "https://example.com/secure.bin");
+        assert_eq!(tasks[2].file_name, "secure.bin");
     }
 
     #[test]
-    fn derives_a_file_name_and_skips_a_dltool_url_without_http() {
+    fn derives_a_file_name_and_skips_unsupported_download_schemes() {
         let bare = requests_from_args(&args(&["http://example.com/a%20b.zip?x=1"]));
         assert_eq!(bare[0].file_name, "a b.zip");
 
         let directory = requests_from_args(&args(&["http://example.com/"]));
         assert_eq!(directory[0].file_name, "download");
 
-        let missing = requests_from_args(&args(&[
-            "dltool://add?url=https%3A%2F%2Fhost%2Fa",
+        let tasks = requests_from_args(&args(&[
+            "dltool://add?url=ftp%3A%2F%2Fhost%2Fa",
+            "dltool://add?url=https%3A%2F%2Fhost%2Fa&fileName=secure.bin",
             "DLTOOL://add?url=http://example.com/from-scheme.bin",
         ]));
-        assert_eq!(missing.len(), 1);
-        assert_eq!(missing[0].url, "http://example.com/from-scheme.bin");
-        assert_eq!(missing[0].file_name, "from-scheme.bin");
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks[0].url, "https://host/a");
+        assert_eq!(tasks[0].file_name, "secure.bin");
+        assert_eq!(tasks[1].url, "http://example.com/from-scheme.bin");
+        assert_eq!(tasks[1].file_name, "from-scheme.bin");
     }
 
     #[test]

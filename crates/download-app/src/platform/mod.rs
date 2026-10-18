@@ -54,6 +54,51 @@ pub fn set_autostart(enabled: bool, exe: &Path) -> Result<(), String> {
     }
 }
 
+/// Open the folder that contains `path`, selecting the file when possible.
+pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        windows::reveal_in_folder(path)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::reveal_in_folder(path)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::reveal_in_folder(path)
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+        Err("opening folders is not implemented for this OS".into())
+    }
+}
+
+/// Put a local file on the system clipboard so Finder/Explorer can paste it.
+pub fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
+    if !path.is_file() {
+        return Err(format!("文件不存在：{}", path.display()));
+    }
+    #[cfg(windows)]
+    {
+        windows::copy_file_to_clipboard(path)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::copy_file_to_clipboard(path)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::copy_file_to_clipboard(path)
+    }
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+    {
+        let _ = path;
+        Err("copying files is not implemented for this OS".into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -193,7 +238,7 @@ mod tests {
             windows::RUN_KEY,
             r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
         );
-        assert_eq!(windows::RUN_VALUE_NAME, "Download Tool");
+        assert_eq!(windows::RUN_VALUE_NAME, "下载器");
     }
 
     #[cfg(target_os = "macos")]

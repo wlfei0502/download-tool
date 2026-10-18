@@ -101,6 +101,12 @@ impl Aria2Client {
             .map(|_| ())
     }
 
+    pub async fn remove_download_result(&self, gid: &str) -> Result<(), String> {
+        self.call("aria2.removeDownloadResult", vec![json!(gid)])
+            .await
+            .map(|_| ())
+    }
+
     pub async fn get_version(&self) -> Result<Value, String> {
         self.call("aria2.getVersion", Vec::new()).await
     }
@@ -146,6 +152,10 @@ impl Aria2Api for Aria2Client {
 
     async fn remove(&self, gid: &str) -> Result<(), String> {
         Self::remove(self, gid).await
+    }
+
+    async fn remove_download_result(&self, gid: &str) -> Result<(), String> {
+        Self::remove_download_result(self, gid).await
     }
 
     async fn tell_status(&self, gid: &str) -> Result<Value, String> {

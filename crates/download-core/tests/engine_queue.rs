@@ -27,6 +27,9 @@ enum Call {
     Remove {
         gid: String,
     },
+    RemoveDownloadResult {
+        gid: String,
+    },
     TellStatus {
         gid: String,
     },
@@ -138,6 +141,17 @@ impl Aria2Api for FakeAria2 {
         Ok(())
     }
 
+    async fn remove_download_result(&self, gid: &str) -> Result<(), String> {
+        self.inner
+            .lock()
+            .expect("fake lock")
+            .calls
+            .push(Call::RemoveDownloadResult {
+                gid: gid.to_string(),
+            });
+        Ok(())
+    }
+
     async fn tell_status(&self, gid: &str) -> Result<Value, String> {
         let mut inner = self.inner.lock().expect("fake lock");
         inner.calls.push(Call::TellStatus {
@@ -180,21 +194,16 @@ fn request(url: &str, file_name: &str) -> NewTaskRequest {
 }
 
 #[tokio::test]
-async fn submit_rejects_non_http_urls_and_accepts_http() {
+async fn submit_rejects_non_http_urls_and_accepts_http_https() {
     let aria = FakeAria2::default();
     let mut engine = DownloadEngine::new(aria.clone(), "/downloads");
 
-    for url in [
-        "https://example.com/a.zip",
-        "HTTPS://example.com/a.zip",
-        "ftp://example.com/a.zip",
-        "FTP://files.example.com/a.zip",
-    ] {
+    for url in ["ftp://example.com/a.zip", "FTP://files.example.com/a.zip"] {
         let err = engine
             .submit(request(url, "a.zip"))
             .await
             .expect_err("non-http rejected");
-        assert_eq!(err, "only http:// URLs are allowed");
+        assert_eq!(err, "only http:// and https:// URLs are allowed");
     }
     assert!(engine.manager().await.list().is_empty());
     assert!(aria.calls().is_empty());
@@ -210,7 +219,13 @@ async fn submit_rejects_non_http_urls_and_accepts_http() {
         .await
         .expect("HTTP");
     assert_eq!(task(&engine, &upper).await.status, TaskStatus::Active);
-    assert_eq!(aria.calls().len(), 2);
+
+    let secure = engine
+        .submit(request("https://example.com/c.zip", "c.zip"))
+        .await
+        .expect("https");
+    assert_eq!(task(&engine, &secure).await.url, "https://example.com/c.zip");
+    assert_eq!(aria.calls().len(), 3);
 }
 
 #[tokio::test]
@@ -448,6 +463,40 @@ async fn poll_once_records_rpc_error_and_continues() {
     assert_eq!(healthy_task.status, TaskStatus::Active);
     assert_eq!(healthy_task.completed_length, 8);
     assert_eq!(healthy_task.download_speed, 2);
+}
+
+#[tokio::test]
+async fn cancel_complete_task_uses_remove_download_result() {
+    let aria = FakeAria2::default();
+    let mut engine = DownloadEngine::new(aria.clone(), "/downloads");
+    let id = engine
+        .submit(request("http://example.com/done.zip", "done.zip"))
+        .await
+        .expect("submit");
+    aria.set_status(
+        "gid-1",
+        json!({
+            "status": "complete",
+            "completedLength": "10",
+            "downloadSpeed": "0",
+            "totalLength": "10"
+        }),
+    );
+    engine.poll_once().await.expect("poll");
+    assert_eq!(task(&engine, &id).await.status, TaskStatus::Complete);
+
+    engine.cancel_task(&id).await.expect("cancel complete");
+    assert!(engine.manager().await.list().is_empty());
+    assert!(aria.calls().iter().any(|call| {
+        matches!(
+            call,
+            Call::RemoveDownloadResult { gid } if gid == "gid-1"
+        )
+    }));
+    assert!(!aria
+        .calls()
+        .iter()
+        .any(|call| matches!(call, Call::Remove { .. })));
 }
 
 #[tokio::test]

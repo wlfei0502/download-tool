@@ -20,6 +20,8 @@ pub trait Aria2Api: Send + Sync {
     async fn pause(&self, gid: &str) -> Result<(), String>;
     async fn unpause(&self, gid: &str) -> Result<(), String>;
     async fn remove(&self, gid: &str) -> Result<(), String>;
+    /// Drop a finished download from aria2's result list (`aria2.removeDownloadResult`).
+    async fn remove_download_result(&self, gid: &str) -> Result<(), String>;
     async fn tell_status(&self, gid: &str) -> Result<Value, String>;
     /// `aria2.changeGlobalOption` with `max-overall-download-limit`.
     /// `None` sends `"0"`, which aria2 treats as unlimited.
@@ -196,19 +198,34 @@ impl<A: Aria2Api> DownloadEngine<A> {
     }
 
     pub async fn cancel_task(&mut self, id: &TaskId) -> Result<(), String> {
-        let gid = {
+        let (gid, status) = {
             let manager = self.manager.lock().await;
             let task = manager
                 .get(id)
                 .ok_or_else(|| "task not found".to_string())?;
-            task.gid.clone()
+            (task.gid.clone(), task.status)
         };
         let Some(gid) = gid else {
             let mut manager = self.manager.lock().await;
             manager.remove(id)?;
             return Ok(());
         };
-        self.aria2.remove(&gid).await?;
+        // Finished downloads are no longer "active"; aria2.remove fails with
+        // "Active Download not found" and needs removeDownloadResult instead.
+        match status {
+            TaskStatus::Complete | TaskStatus::Error => {
+                ignore_missing_download(self.aria2.remove_download_result(&gid).await)?;
+            }
+            _ => {
+                if let Err(err) = self.aria2.remove(&gid).await {
+                    if is_inactive_download_error(&err) {
+                        ignore_missing_download(self.aria2.remove_download_result(&gid).await)?;
+                    } else {
+                        return Err(err);
+                    }
+                }
+            }
+        }
         let mut manager = self.manager.lock().await;
         manager.remove(id)?;
         Ok(())
@@ -222,6 +239,18 @@ impl<A: Aria2Api> DownloadEngine<A> {
         task.gid
             .clone()
             .ok_or_else(|| "task has no gid".to_string())
+    }
+}
+
+fn is_inactive_download_error(err: &str) -> bool {
+    err.contains("Active Download not found")
+}
+
+fn ignore_missing_download(result: Result<(), String>) -> Result<(), String> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if err.contains("not found") || err.contains("No such download") => Ok(()),
+        Err(err) => Err(err),
     }
 }
 

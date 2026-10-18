@@ -25,9 +25,16 @@ fn rejects_non_add_actions() {
 }
 
 #[test]
-fn rejects_non_http_download_urls() {
+fn accepts_https_download_urls() {
+    let req = parse_dltool_url("dltool://add?url=https%3A%2F%2Fhost%2Fa&fileName=a.zip").unwrap();
+    assert_eq!(req.url, "https://host/a");
+    assert_eq!(req.file_name, "a.zip");
+}
+
+#[test]
+fn rejects_ftp_download_urls() {
     let err =
-        parse_dltool_url("dltool://add?url=https%3A%2F%2Fhost%2Fa&fileName=a.zip").unwrap_err();
+        parse_dltool_url("dltool://add?url=ftp%3A%2F%2Fhost%2Fa&fileName=a.zip").unwrap_err();
     assert!(err.contains("http"), "{err}");
 }
 

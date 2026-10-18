@@ -5,16 +5,24 @@ Browser helper that sends small files through a normal download and large files 
 ```ts
 import { download } from "download-tool-sdk";
 
+// Already know the download URL (no ticket API):
 const result = await download({
-  fileId: "f_01hxyz",
+  downloadUrl: "https://cdn.example.com/file.zip",
+  fileName: "file.zip",
   size: 1234567890,
-  apiBase: "http://your-host",
   config: {
     sizeThreshold: 104857600,
     installUrl: "http://your-host/download-tool",
     localPort: 29128,
-    protocol: "dltool",
   },
+});
+
+// Or look up via fileId:
+await download({
+  fileId: "f_01hxyz",
+  size: 1234567890,
+  apiBase: "http://your-host",
+  config: { /* ... */ },
   onNeedInstall() {
     // Show the site's own install prompt.
   },
@@ -25,7 +33,7 @@ const result = await download({
 
 ## Order
 
-1. `POST {apiBase}/api/download-ticket` with `{ fileId }`. The ticket's `downloadUrl` stays `http://` and is passed through unchanged.
+1. Resolve the file: if `downloadUrl` + `fileName` are provided, use them; otherwise `POST {apiBase}/api/download-ticket` with `{ fileId }`. The URL must be `http://` or `https://` and is passed through unchanged.
 2. If `size < sizeThreshold` (default **104857600**), click an `<a download>` for that URL and return `{ mode: "browser" }`.
 3. Otherwise `GET http://127.0.0.1:{localPort}/health` with a **400ms** timeout. The default port is **29128**.
 4. Health ready (`ok: true` and `aria2` is not `false`): `POST /v1/tasks` with camelCase `{ url, fileName, size, referrer, userAgent }` and return `{ mode: "local", taskId }`.

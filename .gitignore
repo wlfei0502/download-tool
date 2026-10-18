@@ -1,4 +1,5 @@
-
 .superpowers/
 target/
-.superpowers/
+dist/
+*.dmg
+*.app/

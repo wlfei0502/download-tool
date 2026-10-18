@@ -6,7 +6,7 @@ Desktop downloader for large HTTP files. The app is Rust + egui, with aria2 doin
 dltool://add?url=<percent-encoded-http-url>&fileName=...&size=...
 ```
 
-The inner download URL must be `http://`. `fileName`, `size`, `referrer`, and `userAgent` are optional. A cold start parses those arguments and enqueues the download. If the app is already running, the new process forwards the same arguments and exits.
+The inner download URL must be `http://` or `https://`. `fileName`, `size`, `referrer`, and `userAgent` are optional. A cold start parses those arguments and enqueues the download. If the app is already running, the new process forwards the same arguments and exits.
 
 The local API listens on **`127.0.0.1:29128`** only. JSON on that API and in the JS SDK is camelCase (`fileName`, `taskId`).
 
@@ -37,6 +37,20 @@ export DOWNLOAD_TOOL_ARIA2C="$(command -v aria2c)"
 
 Without a binary the window still opens and tasks can be queued. Downloads do not start until `aria2c` is available. The RPC secret is a per-run UUID and is not exposed on the local task API.
 
+HTTPS downloads need a CA bundle (aria2 OpenSSL builds do not use the OS trust store by themselves). The app passes `--ca-certificate` from, in order:
+
+1. `DOWNLOAD_TOOL_CA_FILE`
+2. `SSL_CERT_FILE` / `CURL_CA_BUNDLE`
+3. `curl-ca-bundle.crt` / `cacert.pem` next to `aria2c` or this app
+4. macOS/Linux: `/etc/ssl/cert.pem` (and similar)
+5. Windows: Git for Windows `...\Git\mingw64\ssl\certs\ca-bundle.crt` if installed
+
+**Windows tip:** put [cacert.pem](https://curl.se/ca/cacert.pem) (or `curl-ca-bundle.crt`) beside `aria2c.exe`, or:
+
+```bat
+set DOWNLOAD_TOOL_CA_FILE=C:\path\to\cacert.pem
+```
+
 ## Run
 
 ```bash
@@ -59,7 +73,7 @@ Content-Type: application/json
 {"url":"http://127.0.0.1:9090/d/<token>","fileName":"data.zip","size":1234567890}
 ```
 
-`POST` returns `{"taskId":"..."}`. `GET /v1/tasks` lists the queue. Only `http://` URLs are accepted.
+`POST` returns `{"taskId":"..."}`. `GET /v1/tasks` lists the queue. Only `http://` and `https://` URLs are accepted.
 
 Pass a protocol URL on the command line when the OS will not launch the bare `cargo run` binary (see macOS below):
 
@@ -166,12 +180,26 @@ cargo run -p download-app -- 'dltool://add?url=http%3A%2F%2F127.0.0.1%2Ffile.bin
 
 ## Packaging
 
-Installer artifacts for Windows, macOS, and Linux are not produced yet. Use the run and smoke steps above until that milestone.
+**Portable first (no installer wizard).** Users unzip / open the app and run it.
 
-When installers are added, use [cargo-packager](https://github.com/crabnebula-dev/cargo-packager) on the `download-app` package:
+### macOS
 
 ```bash
-cargo install cargo-packager --locked
+./scripts/package-macos.sh
 ```
 
-Target formats: NSIS on Windows, a `.app` plus `.dmg` on macOS, and `.deb` on Linux. The macOS bundle `Info.plist` must include the `CFBundleURLTypes` block above so `dltool://` can be registered. Leave the packager updater disabled; this version has no in-app update.
+Produces `dist/macos/下载器.app` and `下载器.dmg`. Opening the `.app` is enough; dragging to Applications is optional. The DMG includes an Applications shortcut and `安装说明.txt`.
+
+### Windows
+
+On a Windows machine (Rust + `aria2c.exe` on `PATH`):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package-windows-portable.ps1
+```
+
+Produces `dist/windows/download-tool/` and `download-tool-portable.zip`. Unzip anywhere and double-click `download-tool.exe` — no Setup.exe. Keep `aria2c.exe` and the CA bundle beside the exe.
+
+### Linux
+
+Not packaged yet; `cargo run -p download-app` / a self-contained folder with `aria2c` beside the binary is the intended portable shape.

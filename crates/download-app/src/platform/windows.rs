@@ -28,7 +28,7 @@ pub fn registry_values(exe: &Path) -> Vec<RegistryValue> {
         RegistryValue {
             key: r"HKCU\Software\Classes\dltool",
             name: None,
-            data: "URL:Download Tool Protocol".into(),
+            data: "URL:下载器协议".into(),
         },
         RegistryValue {
             key: r"HKCU\Software\Classes\dltool",
@@ -76,7 +76,7 @@ pub fn register(exe: &Path) -> Result<(), String> {
 pub const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
 #[cfg(any(windows, test))]
-pub const RUN_VALUE_NAME: &str = "Download Tool";
+pub const RUN_VALUE_NAME: &str = "下载器";
 
 #[cfg(any(windows, test))]
 pub fn run_value(exe: &Path) -> String {
@@ -121,5 +121,52 @@ pub fn set_autostart(enabled: bool, exe: &Path) -> Result<(), String> {
             "reg add {RUN_KEY} failed ({}) {stderr}",
             output.status
         ))
+    }
+}
+
+
+#[cfg(windows)]
+pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        let arg = format!("/select,{}", path.display());
+        let status = Command::new("explorer")
+            .arg(arg)
+            .status()
+            .map_err(|err| format!("explorer: {err}"))?;
+        // explorer often exits non-zero after opening; treat spawn success as ok when status obtained
+        let _ = status;
+        return Ok(());
+    }
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "无效的保存路径".to_string())?;
+    if !dir.is_dir() {
+        return Err(format!("目录不存在：{}", dir.display()));
+    }
+    let status = Command::new("explorer")
+        .arg(dir)
+        .status()
+        .map_err(|err| format!("explorer: {err}"))?;
+    let _ = status;
+    Ok(())
+}
+
+
+#[cfg(windows)]
+pub fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
+    let absolute = std::fs::canonicalize(path)
+        .map_err(|err| format!("resolve {}: {err}", path.display()))?;
+    let path_str = absolute.to_string_lossy().replace('\'', "''");
+    let script = format!("Set-Clipboard -Path '{path_str}'");
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .output()
+        .map_err(|err| format!("powershell: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("Set-Clipboard failed ({}) {stderr}", output.status))
     }
 }

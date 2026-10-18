@@ -20,7 +20,7 @@ pub fn url_types_plist() -> &'static str {
 <array>
     <dict>
         <key>CFBundleURLName</key>
-        <string>Download Tool</string>
+        <string>下载器</string>
         <key>CFBundleURLSchemes</key>
         <array>
             <string>dltool</string>
@@ -211,4 +211,56 @@ fn user_id() -> Result<String, String> {
         return Err(format!("id -u returned {id:?}"));
     }
     Ok(id)
+}
+
+#[cfg(target_os = "macos")]
+pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
+    if path.exists() {
+        let status = Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .status()
+            .map_err(|err| format!("open -R: {err}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err(format!("open -R failed ({status})"));
+    }
+    let dir = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .ok_or_else(|| "无效的保存路径".to_string())?;
+    if !dir.is_dir() {
+        return Err(format!("目录不存在：{}", dir.display()));
+    }
+    let status = Command::new("open")
+        .arg(dir)
+        .status()
+        .map_err(|err| format!("open: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("open failed ({status})"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
+    let absolute = std::fs::canonicalize(path)
+        .map_err(|err| format!("resolve {}: {err}", path.display()))?;
+    let posix = absolute.to_string_lossy();
+    // AppleScript string escaping for POSIX file paths.
+    let escaped = posix.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = format!("set the clipboard to (POSIX file \"{escaped}\")");
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .output()
+        .map_err(|err| format!("osascript: {err}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("osascript failed ({}) {stderr}", output.status))
+    }
 }

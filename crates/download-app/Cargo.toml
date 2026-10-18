@@ -10,10 +10,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 download-core = { path = "../download-core" }
 download-local-api = { path = "../download-local-api" }
 eframe = "0.33"
 egui = "0.33"
+rfd = "0.15"
 serde_json = "1"
 single-instance = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }

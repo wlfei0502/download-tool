@@ -148,6 +148,7 @@ struct TaskJson {
     error: Option<String>,
     completed_length: u64,
     download_speed: u64,
+    created_at: u64,
 }
 
 impl From<&DownloadTask> for TaskJson {
@@ -164,6 +165,7 @@ impl From<&DownloadTask> for TaskJson {
             error: task.error.clone(),
             completed_length: task.completed_length,
             download_speed: task.download_speed,
+            created_at: task.created_at,
         }
     }
 }

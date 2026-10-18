@@ -12,6 +12,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 async-trait = "0.1"
 url = "2"
 directories = "6.0.0"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

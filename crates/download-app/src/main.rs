@@ -1,3 +1,4 @@
+mod fonts;
 mod platform;
 mod single_instance;
 mod tray;
@@ -18,6 +19,7 @@ use download_core::aria2::rpc::Aria2Client;
 use download_core::engine::DownloadEngine;
 use download_core::manager::TaskManager;
 use download_core::settings::{default_save_dir, Settings};
+use download_core::store::{prepare_loaded_task, TaskStore};
 use download_core::task::{DownloadTask, NewTaskRequest, TaskId, TaskStatus};
 use download_local_api::{preflight, routes, with_cors, AppState, DEFAULT_PORT};
 use single_instance::Activation;
@@ -89,7 +91,21 @@ async fn prepare(activation: Activation) -> Result<DownloadUi, String> {
     if let Err(err) = sync_autostart(stored.values.autostart) {
         eprintln!("autostart was not updated: {err}");
     }
-    let tasks = Arc::new(Mutex::new(TaskManager::new()));
+    let store = match TaskStore::open_user() {
+        Ok(store) => Arc::new(store),
+        Err(err) => {
+            eprintln!("task store unavailable: {err}");
+            // Fall back to an in-memory-only session using a temp db when possible.
+            let fallback = std::env::temp_dir().join(format!(
+                "download-tool-tasks-fallback-{}.db",
+                std::process::id()
+            ));
+            Arc::new(TaskStore::open(&fallback).map_err(|e| {
+                format!("无法打开任务数据库：{err}; fallback also failed: {e}")
+            })?)
+        }
+    };
+    let tasks = Arc::new(Mutex::new(load_task_manager(&store)?));
     let (child, mut engine, banner) = start_backend(&stored.values, Arc::clone(&tasks)).await;
     if let Some(banner) = &banner {
         eprintln!("{banner}");
@@ -118,12 +134,14 @@ async fn prepare(activation: Activation) -> Result<DownloadUi, String> {
     )
     .await;
     let settings_for_ui = stored.values.clone();
+    publish(&tasks, &model, &store).await;
     tokio::spawn(run_engine(
         engine,
         tasks,
         commands_rx,
         model.clone(),
         stored,
+        store,
     ));
 
     Ok(DownloadUi::new(
@@ -135,6 +153,14 @@ async fn prepare(activation: Activation) -> Result<DownloadUi, String> {
         aria2.0.take(),
         activation,
     ))
+}
+
+fn load_task_manager(store: &TaskStore) -> Result<TaskManager, String> {
+    let mut manager = TaskManager::new();
+    for task in store.load_all()? {
+        manager.restore(prepare_loaded_task(task))?;
+    }
+    Ok(manager)
 }
 
 fn api_router(
@@ -165,10 +191,9 @@ async fn bind_api() -> Result<TcpListener, String> {
     match TcpListener::bind(addr).await {
         Ok(listener) => Ok(listener),
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => Err(format!(
-            "127.0.0.1:{DEFAULT_PORT} is already in use. \
-             Quit the other Download Tool process and start again."
+            "127.0.0.1:{DEFAULT_PORT} 已被占用。请退出已运行的下载器后再启动。"
         )),
-        Err(err) => Err(format!("failed to bind 127.0.0.1:{DEFAULT_PORT}: {err}")),
+        Err(err) => Err(format!("无法绑定 127.0.0.1:{DEFAULT_PORT}: {err}")),
     }
 }
 
@@ -197,7 +222,7 @@ async fn start_backend(
             None,
             None,
             Some(format!(
-                "aria2c skipped: cannot create save directory {}: {err}",
+                "无法创建保存目录 {}，已跳过 aria2c：{err}",
                 save_dir.display()
             )),
         );
@@ -205,7 +230,7 @@ async fn start_backend(
 
     let port = match pick_rpc_port() {
         Ok(port) => port,
-        Err(err) => return (None, None, Some(format!("aria2c skipped: {err}"))),
+        Err(err) => return (None, None, Some(format!("已跳过 aria2c：{err}"))),
     };
     let secret = rpc_secret();
     let (mut child, client) = match Aria2Process::start(
@@ -220,7 +245,7 @@ async fn start_backend(
                 None,
                 None,
                 Some(format!(
-                    "aria2c is not available ({err}). Tasks can still be queued; downloads will not start."
+                    "未找到 aria2c（{err}）。任务仍可加入队列，但不会开始下载。"
                 )),
             );
         }
@@ -233,7 +258,7 @@ async fn start_backend(
             None,
             None,
             Some(format!(
-                "aria2c started but JSON-RPC did not become ready ({err}). Downloads will not start."
+                "aria2c 已启动但 JSON-RPC 未就绪（{err}）。下载不会开始。"
             )),
         );
     }
@@ -249,7 +274,7 @@ async fn start_backend(
             Some(child),
             Some(engine),
             Some(format!(
-                "global speed limit was not applied ({err}). Downloads will run without that limit."
+                "全局限速未生效（{err}）。将按不限速下载。"
             )),
         );
     }
@@ -369,6 +394,7 @@ async fn run_engine(
     mut commands: mpsc::UnboundedReceiver<Command>,
     model: SharedModel,
     mut stored: StoredSettings,
+    store: Arc<TaskStore>,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -379,7 +405,7 @@ async fn run_engine(
                     break;
                 };
                 handle_command(&mut engine, &tasks, &mut stored, command, &model).await;
-                publish(&tasks, &model).await;
+                publish(&tasks, &model, &store).await;
             }
             _ = ticker.tick() => {
                 if let Some(engine) = engine.as_mut() {
@@ -388,7 +414,7 @@ async fn run_engine(
                         model.set_notice(Some(err));
                     }
                 }
-                publish(&tasks, &model).await;
+                publish(&tasks, &model, &store).await;
             }
         }
     }
@@ -415,6 +441,7 @@ async fn handle_command(
         Command::Pause(id) => control(engine, tasks, model, &id, Control::Pause).await,
         Command::Resume(id) => control(engine, tasks, model, &id, Control::Resume).await,
         Command::Cancel(id) => control(engine, tasks, model, &id, Control::Cancel).await,
+        Command::ClearAll => clear_all(engine, tasks, model).await,
         Command::PauseAll => pause_all(engine, tasks, model).await,
     }
 }
@@ -427,18 +454,18 @@ async fn apply_settings(
 ) {
     let next = next.normalized();
     if next.save_dir.trim().is_empty() {
-        model.set_notice(Some("save directory required".into()));
+        model.set_notice(Some("请选择保存目录".into()));
         return;
     }
     if let Err(err) = std::fs::create_dir_all(&next.save_dir) {
-        model.set_notice(Some(format!("cannot create save directory: {err}")));
+        model.set_notice(Some(format!("无法创建保存目录：{err}")));
         return;
     }
     let autostart_changed = stored.values.autostart != next.autostart;
     stored.values = next;
     let mut notice = None;
     if let Err(err) = stored.save() {
-        notice = Some(format!("could not save settings: {err}"));
+        notice = Some(format!("无法保存设置：{err}"));
     }
     if let Some(engine) = engine.as_mut() {
         engine.set_save_dir(&stored.values.save_dir);
@@ -447,12 +474,12 @@ async fn apply_settings(
             .set_global_speed_limit(stored.values.global_speed_limit_bps)
             .await
         {
-            notice = Some(format!("speed limit was not applied: {err}"));
+            notice = Some(format!("限速未生效：{err}"));
         }
     }
     if autostart_changed {
         if let Err(err) = sync_autostart(stored.values.autostart) {
-            notice = Some(format!("autostart was not updated: {err}"));
+            notice = Some(format!("开机启动未更新：{err}"));
         }
     }
     model.set_notice(notice);
@@ -472,7 +499,7 @@ async fn add_task(
         return;
     }
     if dir.is_empty() {
-        model.set_notice(Some("save directory required".into()));
+        model.set_notice(Some("请选择保存目录".into()));
         return;
     }
     let request = NewTaskRequest {
@@ -483,18 +510,18 @@ async fn add_task(
         user_agent: None,
     };
     if let Err(err) = std::fs::create_dir_all(&dir) {
-        model.set_notice(Some(format!("cannot create save directory: {err}")));
+        model.set_notice(Some(format!("无法创建保存目录：{err}")));
         return;
     }
     stored.values.save_dir = dir.clone();
     let save_error = stored
         .save()
         .err()
-        .map(|err| format!("could not save settings: {err}"));
+        .map(|err| format!("无法保存设置：{err}"));
     let Some(engine) = engine.as_mut() else {
         match tasks.lock().await.add(request) {
             Ok(_) => model.set_notice(Some(save_error.unwrap_or_else(|| {
-                "Queued. aria2c is not available, so the download has not started.".into()
+                "已加入队列。未找到 aria2c，下载尚未开始。".into()
             }))),
             Err(err) => model.set_notice(Some(err)),
         }
@@ -532,6 +559,47 @@ async fn pause_all(
         }
     }
     model.set_notice(first_error);
+}
+
+async fn clear_all(
+    engine: &mut Option<DownloadEngine<Aria2Client>>,
+    tasks: &Arc<Mutex<TaskManager>>,
+    model: &SharedModel,
+) {
+    let ids: Vec<TaskId> = {
+        let manager = tasks.lock().await;
+        manager.list().into_iter().map(|task| task.id).collect()
+    };
+    if ids.is_empty() {
+        model.set_notice(None);
+        return;
+    }
+    let mut first_error = None;
+    for id in ids {
+        if let Err(err) = clear_one(engine, tasks, &id).await {
+            first_error.get_or_insert(err);
+        }
+    }
+    model.set_notice(first_error);
+}
+
+async fn clear_one(
+    engine: &mut Option<DownloadEngine<Aria2Client>>,
+    tasks: &Arc<Mutex<TaskManager>>,
+    id: &TaskId,
+) -> Result<(), String> {
+    if let Some(engine) = engine.as_mut() {
+        match engine.cancel_task(id).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // Drop the row even if aria2 already finished or forgot the gid.
+                let _ = tasks.lock().await.remove(id);
+                Err(err)
+            }
+        }
+    } else {
+        tasks.lock().await.remove(id)
+    }
 }
 
 async fn pause_one(
@@ -577,7 +645,7 @@ async fn control(
             }
             return;
         }
-        model.set_notice(Some("aria2c is not available".into()));
+        model.set_notice(Some("未找到 aria2c".into()));
         return;
     };
     let result = match action {
@@ -638,7 +706,7 @@ async fn start_queued(
         return;
     }
     if let Err(err) = std::fs::create_dir_all(save_dir) {
-        model.set_notice(Some(format!("cannot create save directory: {err}")));
+        model.set_notice(Some(format!("无法创建保存目录：{err}")));
         return;
     }
     for request in pending {
@@ -648,8 +716,11 @@ async fn start_queued(
     }
 }
 
-async fn publish(tasks: &Arc<Mutex<TaskManager>>, model: &SharedModel) {
+async fn publish(tasks: &Arc<Mutex<TaskManager>>, model: &SharedModel, store: &TaskStore) {
     let listed = tasks.lock().await.list();
+    if let Err(err) = store.sync_snapshot(&listed) {
+        eprintln!("persist tasks failed: {err}");
+    }
     model.set_tasks(listed);
 }
 
@@ -821,14 +892,14 @@ mod tests {
             Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
                 let message = bind_api().await.expect_err("port already taken");
                 assert!(message.contains("127.0.0.1:29128"));
-                assert!(message.contains("already in use"));
+                assert!(message.contains("已被占用"));
                 return;
             }
             Err(err) => panic!("bind loopback port: {err}"),
         };
         let message = bind_api().await.expect_err("second bind");
         assert!(message.contains("127.0.0.1:29128"));
-        assert!(message.contains("already in use"));
+        assert!(message.contains("已被占用"));
         drop(hold);
     }
 
@@ -969,18 +1040,21 @@ mod tests {
         let requests = crate::single_instance::requests_from_args(&[
             "dltool://add?url=http%3A%2F%2Fhost%2Fd%2Ft&fileName=a.zip&size=9".into(),
             "http://example.com/plain.bin".into(),
-            "https://example.com/nope".into(),
+            "https://example.com/secure.bin".into(),
+            "ftp://example.com/nope".into(),
         ]);
         let mut engine = None;
         enqueue_requests(&mut engine, &tasks, requests).await;
         let mut listed = tasks.lock().await.list();
         listed.sort_by(|left, right| left.file_name.cmp(&right.file_name));
-        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.len(), 3);
         assert_eq!(listed[0].file_name, "a.zip");
         assert_eq!(listed[0].url, "http://host/d/t");
         assert_eq!(listed[0].size, Some(9));
         assert_eq!(listed[1].file_name, "plain.bin");
         assert_eq!(listed[1].url, "http://example.com/plain.bin");
+        assert_eq!(listed[2].file_name, "secure.bin");
+        assert_eq!(listed[2].url, "https://example.com/secure.bin");
     }
 
     #[tokio::test]
@@ -996,7 +1070,7 @@ mod tests {
                 save_dir: dir.join("in").to_string_lossy().into_owned(),
                 global_speed_limit_bps: None,
                 max_connections_per_server: 8,
-                autostart: false,
+                autostart: true,
             },
             path: Some(path.clone()),
         };
@@ -1009,7 +1083,7 @@ mod tests {
                 save_dir: save_dir.to_string_lossy().into_owned(),
                 global_speed_limit_bps: Some(2048),
                 max_connections_per_server: 4,
-                autostart: false,
+                autostart: true,
             },
             &model,
         )
@@ -1019,7 +1093,7 @@ mod tests {
         assert_eq!(loaded.save_dir, save_dir.to_string_lossy());
         assert_eq!(loaded.global_speed_limit_bps, Some(2048));
         assert_eq!(loaded.max_connections_per_server, 4);
-        assert!(!loaded.autostart);
+        assert!(loaded.autostart);
         assert!(save_dir.is_dir());
         let (_, notice) = model.view();
         assert_eq!(notice, None);

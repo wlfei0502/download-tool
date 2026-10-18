@@ -35,7 +35,7 @@ impl Tray {
         let menu = build_menu()?;
         let icon = tray_icon::TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("Download Tool")
+            .with_tooltip("下载器")
             .with_icon(icon)
             .with_icon_as_template(cfg!(target_os = "macos"))
             .build()
@@ -76,9 +76,9 @@ fn build_menu() -> Result<tray_icon::menu::Menu, String> {
     use tray_icon::menu::{Menu, MenuItem, PredefinedMenuItem};
 
     let menu = Menu::new();
-    let show = MenuItem::with_id(SHOW_ID, "Show", true, None);
-    let pause_all = MenuItem::with_id(PAUSE_ALL_ID, "Pause all", true, None);
-    let quit = MenuItem::with_id(QUIT_ID, "Quit", true, None);
+    let show = MenuItem::with_id(SHOW_ID, "显示窗口", true, None);
+    let pause_all = MenuItem::with_id(PAUSE_ALL_ID, "全部暂停", true, None);
+    let quit = MenuItem::with_id(QUIT_ID, "退出", true, None);
     let separator = PredefinedMenuItem::separator();
     menu.append_items(&[&show, &pause_all, &separator, &quit])
         .map_err(|err| err.to_string())?;

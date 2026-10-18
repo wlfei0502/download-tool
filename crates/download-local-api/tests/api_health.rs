@@ -262,12 +262,7 @@ async fn post_same_url_returns_existing_task_id() {
 #[tokio::test]
 async fn post_task_rejects_non_http_urls() {
     let app = app(state());
-    for url in [
-        "https://example.com/d/x",
-        "HTTPS://example.com/d/x",
-        "ftp://example.com/d/x",
-        "FTP://example.com/d/x",
-    ] {
+    for url in ["ftp://example.com/d/x", "FTP://example.com/d/x"] {
         let body = json!({
             "url": url,
             "fileName": "x.bin"
@@ -287,8 +282,28 @@ async fn post_task_rejects_non_http_urls() {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             json_body(res).await["error"],
-            "only http:// URLs are allowed"
+            "only http:// and https:// URLs are allowed"
         );
+    }
+
+    for url in ["https://example.com/d/ok", "HTTPS://example.com/d/ok"] {
+        let body = json!({
+            "url": url,
+            "fileName": "ok.bin"
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/tasks")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     let listed = app
@@ -301,7 +316,8 @@ async fn post_task_rejects_non_http_urls() {
         )
         .await
         .unwrap();
-    assert_eq!(json_body(listed).await.as_array().unwrap().len(), 0);
+    // https + HTTPS are different URL strings, so two tasks.
+    assert_eq!(json_body(listed).await.as_array().unwrap().len(), 2);
 
     let body = json!({
         "url": "HTTP://example.com/d/x",

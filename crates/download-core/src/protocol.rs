@@ -3,7 +3,7 @@ use url::Url;
 
 /// Parse `dltool://add?url=...&fileName=...&size=...`.
 ///
-/// The inner download URL must be `http://`. `fileName` is optional; an omitted
+/// The inner download URL must be `http://` or `https://`. `fileName` is optional; an omitted
 /// or unsafe name is taken from the download URL path. `referrer` and
 /// `userAgent` are optional and match the local API body.
 pub fn parse_dltool_url(input: &str) -> Result<NewTaskRequest, String> {

@@ -4,6 +4,7 @@ use std::process::{Child, Command};
 use super::rpc::Aria2Client;
 
 const ENV_ARIA2C: &str = "DOWNLOAD_TOOL_ARIA2C";
+const ENV_CA_FILE: &str = "DOWNLOAD_TOOL_CA_FILE";
 
 /// Locate `aria2c`.
 ///
@@ -47,6 +48,16 @@ fn vendor_relative() -> PathBuf {
 }
 
 fn find_vendored_binary() -> Result<PathBuf, String> {
+    // App bundles / installers often ship aria2c next to this executable.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let sibling = dir.join(binary_name());
+            if sibling.is_file() {
+                return Ok(sibling);
+            }
+        }
+    }
+
     let rel = vendor_relative();
     let mut roots = Vec::new();
     if let Ok(cwd) = std::env::current_dir() {
@@ -97,13 +108,21 @@ impl Aria2Process {
         max_connections_per_server: u8,
     ) -> Result<(Child, Aria2Client), String> {
         let bin = resolve_aria2c_path(None)?;
-        let mut command = Command::new(&bin);
-        command.args(launch_args(
+        let args = launch_args(
             rpc_port,
             secret,
             dir,
             max_connections_per_server,
-        ));
+        );
+        if let Some(ca) = args.iter().find_map(|arg| arg.strip_prefix("--ca-certificate=")) {
+            eprintln!("aria2 CA certificate: {ca}");
+        } else {
+            eprintln!(
+                "aria2 CA certificate: none found (HTTPS may fail); set {ENV_CA_FILE} or SSL_CERT_FILE"
+            );
+        }
+        let mut command = Command::new(&bin);
+        command.args(&args);
         let child = command
             .spawn()
             .map_err(|err| format!("failed to spawn {}: {err}", bin.display()))?;
@@ -115,6 +134,94 @@ impl Aria2Process {
     }
 }
 
+/// Locate a PEM/CRT CA bundle for HTTPS verification.
+///
+/// Order: `DOWNLOAD_TOOL_CA_FILE` → `SSL_CERT_FILE` → `CURL_CA_BUNDLE` →
+/// files next to `aria2c` / this app → OS-specific defaults.
+///
+/// Windows note: stock `aria2c` (OpenSSL builds) does **not** use the Windows
+/// certificate store. Ship `curl-ca-bundle.crt` beside `aria2c.exe`, or set
+/// `DOWNLOAD_TOOL_CA_FILE` to a Mozilla/curl CA bundle path.
+pub fn resolve_ca_certificate() -> Option<PathBuf> {
+    for key in [ENV_CA_FILE, "SSL_CERT_FILE", "CURL_CA_BUNDLE"] {
+        if let Ok(value) = std::env::var(key) {
+            let path = PathBuf::from(value);
+            if !path.as_os_str().is_empty() && path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    for candidate in ca_certificate_candidates() {
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn push_bundle_names(paths: &mut Vec<PathBuf>, dir: &Path) {
+    for name in [
+        "curl-ca-bundle.crt",
+        "ca-bundle.crt",
+        "cacert.pem",
+        "cert.pem",
+    ] {
+        paths.push(dir.join(name));
+    }
+}
+
+fn ca_certificate_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+
+    // Prefer a bundle next to aria2c (typical Windows packaging layout).
+    if let Ok(aria2) = resolve_aria2c_path(None) {
+        if let Some(dir) = aria2.parent() {
+            push_bundle_names(&mut paths, dir);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            push_bundle_names(&mut paths, dir);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        paths.extend([
+            PathBuf::from("/etc/ssl/cert.pem"),
+            PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
+            PathBuf::from("/etc/pki/tls/certs/ca-bundle.crt"),
+            PathBuf::from("/etc/ssl/ca-bundle.pem"),
+        ]);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        paths.push(PathBuf::from("/opt/homebrew/etc/ca-certificates/cert.pem"));
+        paths.push(PathBuf::from("/usr/local/etc/ca-certificates/cert.pem"));
+        paths.push(PathBuf::from("/opt/homebrew/etc/openssl@3/cert.pem"));
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // Git for Windows ships a curl CA bundle many users already have.
+        if let Ok(program_files) = std::env::var("ProgramFiles") {
+            let git = PathBuf::from(program_files).join("Git");
+            paths.push(git.join("mingw64/ssl/certs/ca-bundle.crt"));
+            paths.push(git.join("usr/ssl/certs/ca-bundle.crt"));
+        }
+        if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
+            let git = PathBuf::from(program_files_x86).join("Git");
+            paths.push(git.join("mingw64/ssl/certs/ca-bundle.crt"));
+        }
+        // Optional Mozilla CA extract under LOCALAPPDATA.
+        if let Ok(local) = std::env::var("LOCALAPPDATA") {
+            let base = PathBuf::from(local).join("download-tool");
+            push_bundle_names(&mut paths, &base);
+        }
+    }
+
+    paths
+}
+
 /// Arguments passed to `aria2c` besides the binary path.
 pub fn launch_args(
     rpc_port: u16,
@@ -123,7 +230,7 @@ pub fn launch_args(
     max_connections_per_server: u8,
 ) -> Vec<String> {
     let connections = crate::settings::clamp_connections(max_connections_per_server);
-    vec![
+    let mut args = vec![
         "--enable-rpc".into(),
         format!("--rpc-listen-port={rpc_port}"),
         format!("--rpc-secret={secret}"),
@@ -132,5 +239,10 @@ pub fn launch_args(
         "--continue=true".into(),
         "--max-concurrent-downloads=5".into(),
         format!("--max-connection-per-server={connections}"),
-    ]
+        "--check-certificate=true".into(),
+    ];
+    if let Some(ca) = resolve_ca_certificate() {
+        args.push(format!("--ca-certificate={}", ca.display()));
+    }
+    args
 }

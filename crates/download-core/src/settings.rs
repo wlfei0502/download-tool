@@ -15,8 +15,12 @@ fn default_max_connections() -> u8 {
     DEFAULT_MAX_CONNECTIONS_PER_SERVER
 }
 
-/// User preferences for where files land, how fast aria2 may download, and
-/// whether the app should start at login.
+fn default_autostart() -> bool {
+    true
+}
+
+/// User preferences for where files land and how fast aria2 may download.
+/// Login autostart is always on (not user-configurable).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -24,6 +28,7 @@ pub struct Settings {
     pub global_speed_limit_bps: Option<u64>,
     #[serde(default = "default_max_connections")]
     pub max_connections_per_server: u8,
+    #[serde(default = "default_autostart")]
     pub autostart: bool,
 }
 
@@ -33,7 +38,7 @@ impl Default for Settings {
             save_dir: String::new(),
             global_speed_limit_bps: None,
             max_connections_per_server: DEFAULT_MAX_CONNECTIONS_PER_SERVER,
-            autostart: false,
+            autostart: true,
         }
     }
 }
@@ -94,6 +99,7 @@ impl Settings {
         if self.global_speed_limit_bps == Some(0) {
             self.global_speed_limit_bps = None;
         }
+        self.autostart = true;
         self
     }
 }

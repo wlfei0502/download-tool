@@ -53,9 +53,9 @@ export async function download(options: DownloadOptions): Promise<DownloadResult
   const threshold = options.config?.sizeThreshold ?? DEFAULT_SIZE_THRESHOLD;
   const port = options.config?.localPort ?? DEFAULT_LOCAL_PORT;
   const protocol = options.config?.protocol ?? DEFAULT_PROTOCOL;
-  const ticket = await requestTicket(options.apiBase, options.fileId, options.size);
+  const ticket = await resolveTicket(options);
 
-  if (options.size < threshold) {
+  if (ticket.size < threshold) {
     triggerBrowserDownload(ticket.downloadUrl, ticket.fileName);
     return { mode: "browser" };
   }
@@ -89,6 +89,24 @@ function installResult(options: DownloadOptions): DownloadResult {
 
 export const DownloadTool = { download };
 
+async function resolveTicket(options: DownloadOptions): Promise<DownloadTicket> {
+  if (options.downloadUrl && options.fileName) {
+    return parseTicket(
+      {
+        fileId: options.fileId ?? "",
+        fileName: options.fileName,
+        size: options.size,
+        downloadUrl: options.downloadUrl,
+      },
+      options.size,
+    );
+  }
+  if (!options.apiBase || !options.fileId) {
+    throw new Error("provide downloadUrl+fileName, or fileId+apiBase");
+  }
+  return requestTicket(options.apiBase, options.fileId, options.size);
+}
+
 async function requestTicket(apiBase: string, fileId: string, fallbackSize: number): Promise<DownloadTicket> {
   const url = `${apiBase.replace(/\/+$/, "")}/api/download-ticket`;
   const body = await postJson(url, { fileId }, "include");
@@ -103,8 +121,9 @@ function parseTicket(value: unknown, fallbackSize: number): DownloadTicket {
   if (typeof body.downloadUrl !== "string" || body.downloadUrl.length === 0) {
     throw new Error("download ticket missing downloadUrl");
   }
-  if (!body.downloadUrl.toLowerCase().startsWith("http://")) {
-    throw new Error("download ticket URL must use http://");
+  const downloadUrl = body.downloadUrl.toLowerCase();
+  if (!downloadUrl.startsWith("http://") && !downloadUrl.startsWith("https://")) {
+    throw new Error("download ticket URL must use http:// or https://");
   }
   if (httpUrlHasUserInfo(body.downloadUrl)) {
     throw new Error("download ticket URL must not include user info");
@@ -164,7 +183,7 @@ function healthReady(body: unknown): boolean {
 }
 
 function httpUrlHasUserInfo(value: string): boolean {
-  const match = /^http:\/\//i.exec(value);
+  const match = /^https?:\/\//i.exec(value);
   if (!match) return false;
   const authority = value.slice(match[0].length).split(/[/?#]/, 1)[0] ?? "";
   return authority.includes("@");

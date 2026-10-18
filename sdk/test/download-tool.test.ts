@@ -189,6 +189,36 @@ describe("download", () => {
     assert.equal(clicks[0]?.href, DOWNLOAD_URL);
   });
 
+  it("skips the ticket API when downloadUrl and fileName are provided", async () => {
+    const calls = installFetch(async (url, init) => {
+      if (url.endsWith("/api/download-ticket")) {
+        throw new Error("ticket must not be requested");
+      }
+      if (url.endsWith("/health")) return jsonResponse({ ok: true, version: "0.1.0" });
+      if (url.endsWith("/v1/tasks")) {
+        assert.deepEqual(JSON.parse(String(init?.body)), {
+          url: DOWNLOAD_URL,
+          fileName: FILE_NAME,
+          size: 200_000_000,
+          referrer: REFERRER,
+          userAgent: USER_AGENT,
+        });
+        return jsonResponse({ taskId: "task-direct" });
+      }
+      throw new Error(`unexpected ${url}`);
+    });
+    installBrowser();
+
+    const result = await download({
+      downloadUrl: DOWNLOAD_URL,
+      fileName: FILE_NAME,
+      size: 200_000_000,
+    });
+
+    assert.deepEqual(result, { mode: "local", taskId: "task-direct" });
+    assert.equal(calls.some((call) => call.url.includes("/api/download-ticket")), false);
+  });
+
   it("posts a camelCase task when the local API is healthy", async () => {
     const calls = installFetch(async (url, init) => {
       if (url.endsWith("/api/download-ticket")) return jsonResponse(ticketBody(200_000_000));
@@ -440,19 +470,36 @@ describe("download", () => {
     );
   });
 
-  it("rejects a ticket whose download URL is not http", async () => {
+  it("rejects a ticket whose download URL is neither http nor https", async () => {
     installFetch(async () =>
       jsonResponse({
         ...ticketBody(1024),
-        downloadUrl: "https://files.example/d/token",
+        downloadUrl: "ftp://files.example/d/token",
       }),
     );
     installBrowser();
 
     await assert.rejects(
       download({ fileId: FILE_ID, size: 1024, apiBase: API_BASE }),
-      /http:\/\//,
+      /http:\/\/ or https:\/\//,
     );
+  });
+
+  it("accepts a ticket whose download URL is https", async () => {
+    installFetch(async (url) => {
+      if (url.endsWith("/api/download-ticket")) {
+        return jsonResponse({
+          ...ticketBody(1024),
+          downloadUrl: "https://files.example/d/token",
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+    const { clicks } = installBrowser();
+
+    const result = await download({ fileId: FILE_ID, size: 1024, apiBase: API_BASE });
+    assert.deepEqual(result, { mode: "browser" });
+    assert.equal(clicks[0]?.href, "https://files.example/d/token");
   });
 
   it("rejects a ticket whose download URL contains user info", async () => {

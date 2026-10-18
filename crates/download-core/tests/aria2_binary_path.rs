@@ -1,4 +1,6 @@
-use download_core::aria2::process::{launch_args, resolve_aria2c_path, Aria2Process};
+use download_core::aria2::process::{
+    launch_args, resolve_aria2c_path, resolve_ca_certificate, Aria2Process,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -164,6 +166,47 @@ fn launch_args_clamp_the_connection_limit() {
     assert!(high
         .iter()
         .any(|arg| arg == "--max-connection-per-server=16"));
+}
+
+#[test]
+fn launch_args_include_ca_certificate_when_available() {
+    let _guard = env_lock();
+    let pem = std::env::temp_dir().join(format!(
+        "dltool-ca-{}-{}.pem",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&pem, b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+        .expect("write pem");
+    let _env = EnvVarGuard::set("DOWNLOAD_TOOL_CA_FILE", pem.to_str().unwrap());
+    let args = launch_args(6800, "secret", Path::new("/downloads"), 4);
+    let expected = format!("--ca-certificate={}", pem.display());
+    assert!(
+        args.iter().any(|arg| arg == &expected),
+        "missing {expected} in {args:?}"
+    );
+    let _ = std::fs::remove_file(&pem);
+}
+
+#[test]
+fn resolve_ca_certificate_prefers_env() {
+    let _guard = env_lock();
+    let pem = std::env::temp_dir().join(format!(
+        "dltool-ca-pref-{}-{}.pem",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(&pem, b"-----BEGIN CERTIFICATE-----\nx\n-----END CERTIFICATE-----\n")
+        .expect("write pem");
+    let _env = EnvVarGuard::set("DOWNLOAD_TOOL_CA_FILE", pem.to_str().unwrap());
+    assert_eq!(resolve_ca_certificate(), Some(pem.clone()));
+    let _ = std::fs::remove_file(&pem);
 }
 
 fn rustc_host_triple() -> String {

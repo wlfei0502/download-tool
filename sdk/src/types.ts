@@ -10,14 +10,26 @@ export type DownloadConfig = {
 };
 
 export type DownloadOptions = {
-  fileId: string;
   size: number;
-  /** Website backend origin, without a trailing path. */
-  apiBase: string;
   config?: DownloadConfig;
   /** Called when the health probe times out, or the app stays down after `dltool://`. */
   onNeedInstall?: () => void;
-};
+} & (
+  | {
+      /** When set with `fileName`, skips `/api/download-ticket`. */
+      downloadUrl: string;
+      fileName: string;
+      fileId?: string;
+      apiBase?: string;
+    }
+  | {
+      /** Looked up via `POST {apiBase}/api/download-ticket`. */
+      fileId: string;
+      apiBase: string;
+      downloadUrl?: undefined;
+      fileName?: undefined;
+    }
+);
 
 export type DownloadResult =
   | { mode: "browser" }

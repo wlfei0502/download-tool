@@ -15,7 +15,7 @@ pub const DESKTOP_FILE_NAME: &str = "dltool.desktop";
 pub fn desktop_entry(exe: &Path) -> String {
     format!(
         "[Desktop Entry]\n\
-         Name=Download Tool\n\
+         Name=下载器\n\
          Comment=Receive dltool:// download links\n\
          Exec={exec} %u\n\
          Type=Application\n\
@@ -102,7 +102,7 @@ pub fn autostart_entry(exe: &Path) -> String {
     format!(
         "[Desktop Entry]\n\
          Type=Application\n\
-         Name=Download Tool\n\
+         Name=下载器\n\
          Exec={exec}\n\
          X-GNOME-Autostart-enabled=true\n\
          Terminal=false\n",
@@ -126,4 +126,76 @@ pub fn set_autostart(enabled: bool, exe: &Path) -> Result<(), String> {
     std::fs::create_dir_all(&dir).map_err(|err| format!("create {}: {err}", dir.display()))?;
     std::fs::write(&path, autostart_entry(exe))
         .map_err(|err| format!("write {}: {err}", path.display()))
+}
+
+#[cfg(target_os = "linux")]
+pub fn reveal_in_folder(path: &Path) -> Result<(), String> {
+    let dir = if path.is_file() {
+        path.parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| "无效的保存路径".to_string())?
+    } else if path.is_dir() {
+        path
+    } else {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .ok_or_else(|| "无效的保存路径".to_string())?;
+        if !parent.is_dir() {
+            return Err(format!("目录不存在：{}", parent.display()));
+        }
+        parent
+    };
+    let status = Command::new("xdg-open")
+        .arg(dir)
+        .status()
+        .map_err(|err| format!("xdg-open: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("xdg-open failed ({status})"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
+    use std::process::Stdio;
+    let absolute = std::fs::canonicalize(path)
+        .map_err(|err| format!("resolve {}: {err}", path.display()))?;
+    let uri = format!("file://{}", absolute.display());
+    // Prefer wl-copy, then xclip.
+    if let Ok(mut child) = Command::new("wl-copy")
+        .arg("--type")
+        .arg("text/uri-list")
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        use std::io::Write;
+        if let Some(stdin) = child.stdin.as_mut() {
+            let _ = writeln!(stdin, "{uri}");
+        }
+        let status = child.wait().map_err(|err| format!("wl-copy: {err}"))?;
+        if status.success() {
+            return Ok(());
+        }
+    }
+    let mut child = Command::new("xclip")
+        .args(["-selection", "clipboard", "-t", "text/uri-list"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("xclip/wl-copy unavailable: {err}"))?;
+    {
+        use std::io::Write;
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "xclip stdin missing".to_string())?;
+        writeln!(stdin, "{uri}").map_err(|err| format!("xclip write: {err}"))?;
+    }
+    let status = child.wait().map_err(|err| format!("xclip: {err}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("xclip failed ({status})"))
+    }
 }

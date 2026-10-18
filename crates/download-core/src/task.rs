@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -36,22 +38,24 @@ pub struct DownloadTask {
     pub error: Option<String>,
     pub completed_length: u64,
     pub download_speed: u64,
+    /// Unix seconds when the task was created (local clock).
+    pub created_at: u64,
 }
 
-/// Download URLs must use the `http://` scheme and must not carry userinfo
+/// Download URLs must use `http://` or `https://` and must not carry userinfo
 /// (`user:password@host`). Scheme comparison is case-insensitive.
 pub fn require_http_url(url: &str) -> Result<(), String> {
     if url.is_empty() {
         return Err("url required".into());
     }
-    let prefix_len = "http://".len();
-    let is_http = url
-        .get(..prefix_len)
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"));
-    if !is_http {
-        return Err("only http:// URLs are allowed".into());
-    }
-    if authority_has_userinfo(&url[prefix_len..]) {
+    let rest = if url.len() >= 8 && url[..8].eq_ignore_ascii_case("https://") {
+        &url[8..]
+    } else if url.len() >= 7 && url[..7].eq_ignore_ascii_case("http://") {
+        &url[7..]
+    } else {
+        return Err("only http:// and https:// URLs are allowed".into());
+    };
+    if authority_has_userinfo(rest) {
         return Err("url must not include user info".into());
     }
     Ok(())
@@ -80,6 +84,14 @@ impl DownloadTask {
             error: None,
             completed_length: 0,
             download_speed: 0,
+            created_at: now_unix_secs(),
         }
     }
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
