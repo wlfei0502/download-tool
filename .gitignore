@@ -1,7 +1,5 @@
 .superpowers/
 target/
-# Windows portable packaging output (keep sdk/dist tracked for CDN/npm consumers)
-/dist/
 node_modules/
 *.dmg
 *.app/
