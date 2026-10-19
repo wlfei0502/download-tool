@@ -7,7 +7,21 @@
 #[cfg(any(windows, test))]
 use std::path::Path;
 #[cfg(windows)]
-use std::process::Command;
+use std::process::{Command, Stdio};
+
+/// Run a console helper (`reg`, `powershell`, …) without a flashing window.
+/// GUI parents otherwise allocate a brief console for each child.
+#[cfg(windows)]
+fn output_no_window(mut command: Command) -> std::io::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+}
 
 #[cfg(any(windows, test))]
 pub struct RegistryValue {
@@ -57,9 +71,9 @@ pub fn register(exe: &Path) -> Result<(), String> {
         args.push("/d".into());
         args.push(entry.data);
         args.push("/f".into());
-        let output = Command::new("reg")
-            .args(&args)
-            .output()
+        let mut command = Command::new("reg");
+        command.args(&args);
+        let output = output_no_window(command)
             .map_err(|err| format!("reg add {}: {err}", entry.key))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -86,10 +100,10 @@ pub fn run_value(exe: &Path) -> String {
 #[cfg(windows)]
 pub fn set_autostart(enabled: bool, exe: &Path) -> Result<(), String> {
     if !enabled {
-        let output = Command::new("reg")
-            .args(["delete", RUN_KEY, "/v", RUN_VALUE_NAME, "/f"])
-            .output()
-            .map_err(|err| format!("reg delete: {err}"))?;
+        let mut command = Command::new("reg");
+        command.args(["delete", RUN_KEY, "/v", RUN_VALUE_NAME, "/f"]);
+        let output =
+            output_no_window(command).map_err(|err| format!("reg delete: {err}"))?;
         if output.status.success() || output.status.code() == Some(1) {
             return Ok(());
         }
@@ -99,20 +113,19 @@ pub fn set_autostart(enabled: bool, exe: &Path) -> Result<(), String> {
             output.status
         ));
     }
-    let output = Command::new("reg")
-        .args([
-            "add",
-            RUN_KEY,
-            "/v",
-            RUN_VALUE_NAME,
-            "/t",
-            "REG_SZ",
-            "/d",
-            &run_value(exe),
-            "/f",
-        ])
-        .output()
-        .map_err(|err| format!("reg add: {err}"))?;
+    let mut command = Command::new("reg");
+    command.args([
+        "add",
+        RUN_KEY,
+        "/v",
+        RUN_VALUE_NAME,
+        "/t",
+        "REG_SZ",
+        "/d",
+        &run_value(exe),
+        "/f",
+    ]);
+    let output = output_no_window(command).map_err(|err| format!("reg add: {err}"))?;
     if output.status.success() {
         Ok(())
     } else {
@@ -159,10 +172,9 @@ pub fn copy_file_to_clipboard(path: &Path) -> Result<(), String> {
         .map_err(|err| format!("resolve {}: {err}", path.display()))?;
     let path_str = absolute.to_string_lossy().replace('\'', "''");
     let script = format!("Set-Clipboard -Path '{path_str}'");
-    let output = Command::new("powershell")
-        .args(["-NoProfile", "-Command", &script])
-        .output()
-        .map_err(|err| format!("powershell: {err}"))?;
+    let mut command = Command::new("powershell");
+    command.args(["-NoProfile", "-Command", &script]);
+    let output = output_no_window(command).map_err(|err| format!("powershell: {err}"))?;
     if output.status.success() {
         Ok(())
     } else {

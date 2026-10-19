@@ -290,6 +290,96 @@ async fn submit_same_url_reuses_task_without_second_add() {
 }
 
 #[tokio::test]
+async fn submit_duplicate_complete_url_adds_new_task_without_removing_old() {
+    let aria = FakeAria2::default();
+    let mut engine = DownloadEngine::new(aria.clone(), "/downloads");
+    let req = request("http://example.com/a.zip", "a.zip");
+
+    let first = engine.submit(req.clone()).await.expect("first");
+    aria.set_status(
+        "gid-1",
+        json!({
+            "status": "complete",
+            "completedLength": "100",
+            "downloadSpeed": "0",
+            "totalLength": "100",
+            "files": [{ "path": "/downloads/a.zip" }]
+        }),
+    );
+    engine.poll_once().await.expect("poll");
+    assert_eq!(task(&engine, &first).await.status, TaskStatus::Complete);
+    assert_eq!(task(&engine, &first).await.file_name, "a.zip");
+
+    let second = engine.submit(req).await.expect("duplicate download");
+    assert_ne!(second, first);
+    assert_eq!(engine.manager().await.list().len(), 2);
+    assert_eq!(task(&engine, &first).await.status, TaskStatus::Complete);
+    let duplicate = task(&engine, &second).await;
+    assert_eq!(duplicate.status, TaskStatus::Active);
+    assert_eq!(duplicate.gid.as_deref(), Some("gid-2"));
+    assert_eq!(
+        aria.calls()
+            .iter()
+            .filter(|call| matches!(call, Call::AddUri { .. }))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn poll_once_updates_file_name_when_aria2_auto_renames() {
+    let aria = FakeAria2::default();
+    let mut engine = DownloadEngine::new(aria.clone(), "/downloads");
+    let id = engine
+        .submit(request("http://example.com/a.zip", "a.zip"))
+        .await
+        .expect("submit");
+
+    aria.set_status(
+        "gid-1",
+        json!({
+            "status": "active",
+            "completedLength": "10",
+            "downloadSpeed": "1",
+            "totalLength": "100",
+            "files": [{ "path": "/downloads/a.1.zip" }]
+        }),
+    );
+    engine.poll_once().await.expect("poll");
+
+    let task = task(&engine, &id).await;
+    assert_eq!(task.file_name, "a.1.zip");
+    assert_eq!(task.completed_length, 10);
+}
+
+#[tokio::test]
+async fn submit_redownloads_error_task() {
+    let aria = FakeAria2::default();
+    let mut engine = DownloadEngine::new(aria.clone(), "/downloads");
+    let req = request("http://example.com/bad.zip", "bad.zip");
+
+    let id = engine.submit(req.clone()).await.expect("first");
+    aria.set_status(
+        "gid-1",
+        json!({
+            "status": "error",
+            "completedLength": "3",
+            "downloadSpeed": "0",
+            "errorMessage": "not found"
+        }),
+    );
+    engine.poll_once().await.expect("poll");
+    assert_eq!(task(&engine, &id).await.status, TaskStatus::Error);
+
+    let again = engine.submit(req).await.expect("retry");
+    assert_eq!(again, id);
+    let refreshed = task(&engine, &again).await;
+    assert_eq!(refreshed.status, TaskStatus::Active);
+    assert!(refreshed.error.is_none());
+    assert_eq!(refreshed.gid.as_deref(), Some("gid-2"));
+}
+
+#[tokio::test]
 async fn submit_retries_add_uri_when_previous_attempt_has_no_gid() {
     let aria = FakeAria2::default();
     aria.fail_next_add("rpc down");
@@ -349,10 +439,45 @@ async fn poll_once_updates_progress_for_active_tasks() {
     assert_eq!(task.status, TaskStatus::Active);
     assert_eq!(task.completed_length, 40);
     assert_eq!(task.download_speed, 10);
+    assert_eq!(task.size, Some(100));
     assert!(aria.calls().iter().any(|call| call
         == &Call::TellStatus {
             gid: "gid-1".into()
         }));
+}
+
+#[tokio::test]
+async fn poll_once_complete_aligns_size_with_completed_length() {
+    let aria = FakeAria2::default();
+    let mut engine = DownloadEngine::new(aria.clone(), "/downloads");
+    let id = engine
+        .submit(NewTaskRequest {
+            url: "http://example.com/bulk.txt".into(),
+            file_name: "bulk.txt".into(),
+            // Site/SDK size slightly larger than the real object.
+            size: Some(101),
+            referrer: None,
+            user_agent: None,
+        })
+        .await
+        .expect("submit");
+
+    aria.set_status(
+        "gid-1",
+        json!({
+            "status": "complete",
+            "completedLength": "100",
+            "downloadSpeed": "0",
+            "totalLength": "100"
+        }),
+    );
+
+    engine.poll_once().await.expect("poll");
+
+    let task = task(&engine, &id).await;
+    assert_eq!(task.status, TaskStatus::Complete);
+    assert_eq!(task.completed_length, 100);
+    assert_eq!(task.size, Some(100));
 }
 
 #[tokio::test]

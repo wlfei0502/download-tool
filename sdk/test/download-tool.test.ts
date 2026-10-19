@@ -124,30 +124,77 @@ afterEach(() => {
 });
 
 describe("download", () => {
-  it("downloads small files in the browser from the ticket URL", async () => {
-    const calls = installFetch(async (url, init) => {
-      assert.equal(url, `${API_BASE}/api/download-ticket`);
-      assert.equal(init?.method, "POST");
-      assert.equal(header(init, "content-type"), "application/json");
-      assert.deepEqual(JSON.parse(String(init?.body)), { fileId: FILE_ID });
-      return jsonResponse(ticketBody(1024));
+  it("downloads small files via blob so cross-origin filenames are honored", async () => {
+    const objectUrls: string[] = [];
+    const originalCreate = URL.createObjectURL;
+    const originalRevoke = URL.revokeObjectURL;
+    URL.createObjectURL = ((blob: Blob) => {
+      assert.ok(blob instanceof Blob);
+      const url = `blob:http://site.example/${objectUrls.length}`;
+      objectUrls.push(url);
+      return url;
+    }) as typeof URL.createObjectURL;
+    URL.revokeObjectURL = ((url: string) => {
+      assert.equal(url, objectUrls[0]);
+    }) as typeof URL.revokeObjectURL;
+
+    try {
+      const calls = installFetch(async (url, init) => {
+        if (url === `${API_BASE}/api/download-ticket`) {
+          assert.equal(init?.method, "POST");
+          assert.equal(header(init, "content-type"), "application/json");
+          assert.deepEqual(JSON.parse(String(init?.body)), { fileId: FILE_ID });
+          return jsonResponse(ticketBody(1024));
+        }
+        if (url === DOWNLOAD_URL) {
+          assert.equal(init?.method, "GET");
+          assert.equal(init?.mode, "cors");
+          assert.equal(init?.credentials, "omit");
+          return new Response("hello", {
+            status: 200,
+            headers: { "content-type": "text/plain" },
+          });
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      });
+      const { location, clicks } = installBrowser();
+
+      const result = await download({
+        fileId: FILE_ID,
+        size: 1024,
+        apiBase: `${API_BASE}/`,
+      });
+
+      assert.deepEqual(result, { mode: "browser" });
+      assert.deepEqual(clicks, [{ href: "blob:http://site.example/0", download: FILE_NAME }]);
+      assert.equal(location.href, PAGE);
+      assert.equal(objectUrls.length, 1);
+      assert.equal(
+        calls.some((call) => call.url.includes("127.0.0.1:29128")),
+        false,
+      );
+    } finally {
+      URL.createObjectURL = originalCreate;
+      URL.revokeObjectURL = originalRevoke;
+    }
+  });
+
+  it("falls back to an anchor click when the file URL is not CORS-readable", async () => {
+    installFetch(async (url) => {
+      if (url.endsWith("/api/download-ticket")) return jsonResponse(ticketBody(1024));
+      if (url === DOWNLOAD_URL) throw new TypeError("Failed to fetch");
+      throw new Error(`unexpected fetch ${url}`);
     });
-    const { location, clicks } = installBrowser();
+    const { clicks } = installBrowser();
 
     const result = await download({
       fileId: FILE_ID,
       size: 1024,
-      apiBase: `${API_BASE}/`,
+      apiBase: API_BASE,
     });
 
     assert.deepEqual(result, { mode: "browser" });
     assert.deepEqual(clicks, [{ href: DOWNLOAD_URL, download: FILE_NAME }]);
-    assert.equal(location.href, PAGE);
-    assert.equal(calls.length, 1);
-    assert.equal(
-      calls.some((call) => call.url.includes("127.0.0.1")),
-      false,
-    );
   });
 
   it("treats a file at the default threshold as a local download", async () => {
@@ -175,18 +222,36 @@ describe("download", () => {
   });
 
   it("keeps the browser path when size is below a custom threshold", async () => {
-    installFetch(async () => jsonResponse(ticketBody(50)));
-    const { clicks } = installBrowser();
+    const objectUrls: string[] = [];
+    const originalCreate = URL.createObjectURL;
+    URL.createObjectURL = (() => {
+      const url = `blob:http://site.example/${objectUrls.length}`;
+      objectUrls.push(url);
+      return url;
+    }) as typeof URL.createObjectURL;
+    try {
+      installFetch(async (url) => {
+        if (url.endsWith("/api/download-ticket")) return jsonResponse(ticketBody(50));
+        if (url === DOWNLOAD_URL) {
+          return new Response("x", { status: 200, headers: { "content-type": "text/plain" } });
+        }
+        throw new Error(`unexpected fetch ${url}`);
+      });
+      const { clicks } = installBrowser();
 
-    const result = await download({
-      fileId: FILE_ID,
-      size: 50,
-      apiBase: API_BASE,
-      config: { sizeThreshold: 100 },
-    });
+      const result = await download({
+        fileId: FILE_ID,
+        size: 50,
+        apiBase: API_BASE,
+        config: { sizeThreshold: 100 },
+      });
 
-    assert.deepEqual(result, { mode: "browser" });
-    assert.equal(clicks[0]?.href, DOWNLOAD_URL);
+      assert.deepEqual(result, { mode: "browser" });
+      assert.equal(clicks[0]?.href, "blob:http://site.example/0");
+      assert.equal(clicks[0]?.download, FILE_NAME);
+    } finally {
+      URL.createObjectURL = originalCreate;
+    }
   });
 
   it("skips the ticket API when downloadUrl and fileName are provided", async () => {
@@ -286,7 +351,10 @@ describe("download", () => {
       fileId: FILE_ID,
       size: 200_000_000,
       apiBase: API_BASE,
-      config: { installUrl: "http://site.example/install" },
+      config: {
+        installUrl: "http://site.example/install",
+        protocolSettleMs: 2000,
+      },
       onNeedInstall() {
         installCalls += 1;
       },
@@ -324,7 +392,10 @@ describe("download", () => {
       fileId: FILE_ID,
       size: 200_000_000,
       apiBase: API_BASE,
-      config: { installUrl: "http://site.example/get-the-app" },
+      config: {
+        installUrl: "http://site.example/get-the-app",
+        protocolSettleMs: 400,
+      },
     });
 
     assert.deepEqual(result, { mode: "install" });

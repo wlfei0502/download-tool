@@ -1,6 +1,6 @@
 {
   "name": "dltool-sdk",
-  "version": "0.1.1",
+  "version": "0.1.4",
   "description": "Browser SDK that sends small files to the browser and large files to the local download tool.",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -22,7 +22,7 @@
   ],
   "scripts": {
     "build": "tsup",
-    "test": "npm run build && node --test test/download-tool.test.ts",
+    "test": "npm run build && node --experimental-strip-types --test test/download-tool.test.ts",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {

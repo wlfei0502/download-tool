@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use download_core::settings::{default_save_dir, Settings};
+use download_core::settings::{default_save_dir, CloseAction, Settings};
 
 #[test]
 fn save_and_load_roundtrip_in_temp_dir() {
@@ -12,6 +12,8 @@ fn save_and_load_roundtrip_in_temp_dir() {
         global_speed_limit_bps: Some(1_048_576),
         max_connections_per_server: 4,
         autostart: true,
+        close_ask: false,
+        close_action: CloseAction::Quit,
     };
 
     settings.save(&path).expect("save");
@@ -59,6 +61,8 @@ fn missing_file_loads_defaults() {
     assert_eq!(settings.max_connections_per_server, 8);
     assert_eq!(settings.global_speed_limit_bps, None);
     assert!(settings.autostart);
+    assert!(settings.close_ask);
+    assert_eq!(settings.close_action, CloseAction::Tray);
     assert!(settings.save_dir.is_empty());
 }
 
@@ -78,6 +82,8 @@ fn missing_fields_use_defaults_and_limits_are_normalized() {
     assert_eq!(settings.global_speed_limit_bps, None);
     assert_eq!(settings.max_connections_per_server, 16);
     assert!(settings.autostart);
+    assert!(settings.close_ask);
+    assert_eq!(settings.close_action, CloseAction::Tray);
 
     std::fs::write(&path, r#"{"max_connections_per_server":0}"#).expect("write zero");
     let clamped = Settings::load(&path).expect("zero connections");

@@ -117,10 +117,10 @@ Outputs:
 ## Order
 
 1. Resolve the file: if `downloadUrl` + `fileName` are provided, use them; otherwise `POST {apiBase}/api/download-ticket` with `{ fileId }`. The URL must be `http://` or `https://` and is passed through unchanged.
-2. If `size < sizeThreshold` (default **104857600**), click an `<a download>` for that URL and return `{ mode: "browser" }`.
+2. If `size < sizeThreshold` (default **104857600**), download in the browser and return `{ mode: "browser" }`. The SDK `fetch`es the file (CORS) into a Blob, then clicks `<a download>` on an object URL so the filename works **cross-origin**. If the file host does not allow CORS, it falls back to a direct `<a download>` (browsers then ignore `download` and may open text in-tab). Prefer a same-origin proxy URL or `Access-Control-Allow-Origin` on the file server.
 3. Otherwise `GET http://127.0.0.1:{localPort}/health` with a **400ms** timeout. The default port is **29128**.
 4. Health ready (`ok: true` and `aria2` is not `false`): `POST /v1/tasks` with camelCase `{ url, fileName, size, referrer, userAgent }` and return `{ mode: "local", taskId }`.
-5. Connection error, or a health body that is not ready: set `window.location.href` to `{protocol}://add?url=...&fileName=...&size=...` (default scheme `dltool`), then poll `/health` for about **2s**.
+5. Connection error, or a health body that is not ready: set `window.location.href` to `{protocol}://add?url=...&fileName=...&size=...` (default scheme `dltool`), then poll `/health` for about **15s** (`config.protocolSettleMs`). This covers the browser’s “Open download-tool.exe?” confirmation and cold start.
 6. If that poll sees the app, return `{ mode: "protocol" }`. If the app is still unreachable, call `onNeedInstall` when it was provided. If it was omitted and `installUrl` is set, open that URL. Return `{ mode: "install" }`.
 7. A first-probe timeout uses that same install path and does not open the protocol URL.
 

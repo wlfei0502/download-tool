@@ -9,11 +9,25 @@ async fn add_uri_returns_gid() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/jsonrpc"))
+        .and(body_partial_json(json!({
+            "method": "aria2.addUri",
+            "params": [
+                ["http://example.com/file.bin"],
+                {
+                    "dir": "/tmp",
+                    "out": "file.bin",
+                    "max-connection-per-server": "8",
+                    "allow-overwrite": "false",
+                    "auto-file-renaming": "true"
+                }
+            ]
+        })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "jsonrpc": "2.0",
             "id": "1",
             "result": "2089b05ecca3d829"
         })))
+        .expect(1)
         .mount(&server)
         .await;
 
@@ -28,6 +42,7 @@ async fn add_uri_returns_gid() {
     .await
     .unwrap();
     assert_eq!(gid, "2089b05ecca3d829");
+    server.verify().await;
 }
 
 #[tokio::test]

@@ -8,7 +8,7 @@ export const DEFAULT_PROTOCOL = "dltool";
 
 const HEALTH_TIMEOUT_MS = 400;
 /** How long to wait for the app after `dltool://` before showing install. */
-const PROTOCOL_SETTLE_MS = 2000;
+export const DEFAULT_PROTOCOL_SETTLE_MS = 15_000;
 const PROTOCOL_POLL_GAP_MS = 200;
 
 type Probe = "ok" | "down" | "unready" | "timeout";
@@ -42,7 +42,8 @@ type BrowserWindow = {
 /**
  * Hand a file to the browser, the local download app, or the install guide.
  *
- * Small files (`size < sizeThreshold`) download in the browser. Larger files
+ * Small files (`size < sizeThreshold`) download in the browser via Blob (so
+ * cross-origin filenames still work when CORS allows). Larger files
  * probe `http://127.0.0.1:{port}/health`. A ready app (`ok` and aria2 not false)
  * receives `POST /v1/tasks`. A refused connection or a not-ready health body
  * opens `{protocol}://add?...` and polls `/health` briefly. If the app is still
@@ -56,7 +57,7 @@ export async function download(options: DownloadOptions): Promise<DownloadResult
   const ticket = await resolveTicket(options);
 
   if (ticket.size < threshold) {
-    triggerBrowserDownload(ticket.downloadUrl, ticket.fileName);
+    await triggerBrowserDownload(ticket.downloadUrl, ticket.fileName);
     return { mode: "browser" };
   }
 
@@ -71,7 +72,8 @@ export async function download(options: DownloadOptions): Promise<DownloadResult
   }
 
   navigate(buildProtocolUrl(protocol, toLocalTask(ticket)));
-  const settled = await settleAfterProtocol(port);
+  const settleMs = options.config?.protocolSettleMs ?? DEFAULT_PROTOCOL_SETTLE_MS;
+  const settled = await settleAfterProtocol(port, settleMs);
   if (settled === "down") {
     return installResult(options);
   }
@@ -189,8 +191,12 @@ function httpUrlHasUserInfo(value: string): boolean {
   return authority.includes("@");
 }
 
-async function settleAfterProtocol(port: number): Promise<"ok" | "unready" | "down"> {
-  const deadline = Date.now() + PROTOCOL_SETTLE_MS;
+async function settleAfterProtocol(
+  port: number,
+  settleMs: number,
+): Promise<"ok" | "unready" | "down"> {
+  const budget = Math.max(0, settleMs);
+  const deadline = Date.now() + budget;
   while (true) {
     const probe = await probeHealth(port);
     if (probe === "ok") return "ok";
@@ -244,20 +250,59 @@ async function postJson(url: string, body: unknown, credentials: RequestCredenti
   return response.json() as Promise<unknown>;
 }
 
-function triggerBrowserDownload(downloadUrl: string, fileName: string): void {
+/**
+ * Small-file path. Cross-origin `<a download>` is ignored by browsers (e.g. a
+ * `.txt` may open in-tab). Prefer fetch鈫抌lob鈫抩bject URL so `download` always
+ * applies when the file host allows CORS; fall back to a plain anchor otherwise.
+ */
+async function triggerBrowserDownload(downloadUrl: string, fileName: string): Promise<void> {
   const doc = readDocument();
   if (!doc) {
     navigate(downloadUrl);
     return;
   }
+
+  try {
+    const response = await globalThis.fetch(downloadUrl, {
+      method: "GET",
+      mode: "cors",
+      credentials: sameOrigin(downloadUrl) ? "include" : "omit",
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      throw new Error(`GET ${downloadUrl} failed with status ${response.status}`);
+    }
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    try {
+      clickDownloadAnchor(doc, objectUrl, fileName);
+    } finally {
+      URL.revokeObjectURL(objectUrl);
+    }
+  } catch {
+    clickDownloadAnchor(doc, downloadUrl, fileName);
+  }
+}
+
+function clickDownloadAnchor(doc: BrowserDocument, href: string, fileName: string): void {
   const anchor = doc.createElement("a");
-  anchor.href = downloadUrl;
+  anchor.href = href;
   anchor.download = fileName;
   anchor.rel = "noopener";
   if (anchor.style) anchor.style.display = "none";
   doc.body?.appendChild(anchor);
   anchor.click();
   anchor.remove?.();
+}
+
+function sameOrigin(url: string): boolean {
+  try {
+    const page = readWindow()?.location.href;
+    if (!page) return false;
+    return new URL(url, page).origin === new URL(page).origin;
+  } catch {
+    return false;
+  }
 }
 
 function navigate(href: string): void {

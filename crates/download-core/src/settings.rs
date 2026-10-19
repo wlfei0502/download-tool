@@ -19,6 +19,19 @@ fn default_autostart() -> bool {
     true
 }
 
+fn default_close_ask() -> bool {
+    true
+}
+
+/// What happens on window close when the user chose “不再询问”.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CloseAction {
+    #[default]
+    Tray,
+    Quit,
+}
+
 /// User preferences for where files land and how fast aria2 may download.
 /// Login autostart is always on (not user-configurable).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +43,11 @@ pub struct Settings {
     pub max_connections_per_server: u8,
     #[serde(default = "default_autostart")]
     pub autostart: bool,
+    /// When true, closing the main window asks tray vs quit.
+    #[serde(default = "default_close_ask")]
+    pub close_ask: bool,
+    /// Used when `close_ask` is false.
+    pub close_action: CloseAction,
 }
 
 impl Default for Settings {
@@ -39,6 +57,8 @@ impl Default for Settings {
             global_speed_limit_bps: None,
             max_connections_per_server: DEFAULT_MAX_CONNECTIONS_PER_SERVER,
             autostart: true,
+            close_ask: true,
+            close_action: CloseAction::Tray,
         }
     }
 }

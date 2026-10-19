@@ -14,12 +14,24 @@ impl TaskManager {
 
     /// Registers a new download task, or returns the existing id if the URL is already known.
     ///
+    /// A **completed** task for the same URL does not block a new one (duplicate download;
+    /// the previous file is kept). Active / paused / queued / error still dedupe.
+    ///
     /// The URL string is indexed at insert time for deduplication; it must not be changed
     /// afterward (see [`Self::get_mut`]).
     pub fn add(&mut self, req: NewTaskRequest) -> Result<TaskId, String> {
         require_http_url(&req.url)?;
-        if let Some(id) = self.by_url.get(&req.url) {
-            return Ok(id.clone());
+        if let Some(id) = self.by_url.get(&req.url).cloned() {
+            match self.tasks.get(&id).map(|task| task.status) {
+                Some(TaskStatus::Complete) => {
+                    // Free the URL index so another download can be queued.
+                    self.by_url.remove(&req.url);
+                }
+                Some(_) => return Ok(id),
+                None => {
+                    self.by_url.remove(&req.url);
+                }
+            }
         }
         let task = DownloadTask::from_request(req);
         let id = task.id.clone();

@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use download_core::protocol::suggested_file_name;
-use download_core::settings::Settings;
+use download_core::settings::{CloseAction, Settings};
 use download_core::task::{require_http_url, DownloadTask, TaskId, TaskStatus};
 use tokio::sync::mpsc;
 
@@ -79,10 +79,19 @@ pub struct DownloadUi {
     aria2: Option<Child>,
     tray: Option<crate::tray::Tray>,
     quit: bool,
+    close_ask: bool,
+    close_action: CloseAction,
+    /// When set, the close confirmation dialog is open.
+    close_dialog: Option<CloseDialogState>,
     activation: crate::single_instance::Activation,
     /// Keeps the process lock until the window loop ends.
     #[allow(dead_code)]
     instance: Option<crate::single_instance::InstanceLock>,
+}
+
+#[derive(Default)]
+struct CloseDialogState {
+    dont_ask: bool,
 }
 
 impl DownloadUi {
@@ -109,6 +118,9 @@ impl DownloadUi {
             aria2,
             tray: None,
             quit: false,
+            close_ask: settings.close_ask,
+            close_action: settings.close_action,
+            close_dialog: None,
             activation,
             instance: None,
         }
@@ -142,19 +154,114 @@ impl DownloadUi {
             match action {
                 crate::tray::TrayAction::Show => show_main_window(ctx),
                 crate::tray::TrayAction::PauseAll => self.send(Command::PauseAll),
-                crate::tray::TrayAction::Quit => {
-                    self.quit = true;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                }
+                crate::tray::TrayAction::Quit => self.request_quit(ctx),
             }
+        }
+    }
+
+    /// Stop aria2 / the local API, then close the window for real (not to tray).
+    fn request_quit(&mut self, ctx: &egui::Context) {
+        self.quit = true;
+        self.shutdown_backends();
+        // Restore first: a minimized viewport on Windows sometimes ignores Close.
+        show_main_window(ctx);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        ctx.request_repaint();
+    }
+
+    fn shutdown_backends(&mut self) {
+        self.server.abort();
+        if let Some(mut child) = self.aria2.take() {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 
     fn handle_window_close(&mut self, ctx: &egui::Context) {
         let close_requested = ctx.input(|input| input.viewport().close_requested());
-        if close_requested && crate::tray::hide_on_close(self.tray.is_some(), self.quit) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        if !close_requested {
+            return;
+        }
+        match crate::tray::close_decision(
+            self.tray.is_some(),
+            self.quit,
+            self.close_ask,
+            self.close_action,
+        ) {
+            crate::tray::CloseDecision::Ask => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                if self.close_dialog.is_none() {
+                    self.close_dialog = Some(CloseDialogState::default());
+                }
+            }
+            crate::tray::CloseDecision::Tray => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.minimize_to_tray(ctx);
+            }
+            crate::tray::CloseDecision::Quit => {
+                // Real quit (tray 退出 / remembered quit / no tray).
+                self.shutdown_backends();
+            }
+        }
+    }
+
+    fn minimize_to_tray(&self, ctx: &egui::Context) {
+        // Minimize instead of Visible(false): eframe 0.33 on Windows stops
+        // painting when the viewport is invisible, so tray Show never runs.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+
+    fn choose_close(&mut self, ctx: &egui::Context, action: CloseAction, dont_ask: bool) {
+        self.close_dialog = None;
+        if dont_ask {
+            self.close_ask = false;
+            self.close_action = action;
+            let _ = self.commit_settings();
+        }
+        match action {
+            CloseAction::Tray => self.minimize_to_tray(ctx),
+            CloseAction::Quit => self.request_quit(ctx),
+        }
+    }
+
+    fn show_close_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.close_dialog.take() else {
+            return;
+        };
+        let mut open = true;
+        let mut choice = None;
+        egui::Window::new("关闭主窗口")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.label("要退出程序，还是最小化到系统托盘继续下载？");
+                ui.add_space(8.0);
+                ui.checkbox(&mut state.dont_ask, "不再询问");
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    if ui.button("最小化到托盘").clicked() {
+                        choice = Some(CloseAction::Tray);
+                    }
+                    let quit = ui.add(
+                        egui::Button::new(
+                            egui::RichText::new("退出程序").color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(185, 28, 28)),
+                    );
+                    if quit.clicked() {
+                        choice = Some(CloseAction::Quit);
+                    }
+                });
+            });
+        if let Some(action) = choice {
+            self.choose_close(ctx, action, state.dont_ask);
+            return;
+        }
+        if open {
+            self.close_dialog = Some(state);
         }
     }
 
@@ -237,6 +344,8 @@ impl DownloadUi {
             global_speed_limit_bps,
             max_connections_per_server,
             autostart: true,
+            close_ask: self.close_ask,
+            close_action: self.close_action,
         }));
         true
     }
@@ -251,11 +360,7 @@ impl DownloadUi {
 
 impl Drop for DownloadUi {
     fn drop(&mut self) {
-        self.server.abort();
-        if let Some(child) = self.aria2.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        self.shutdown_backends();
     }
 }
 
@@ -265,6 +370,7 @@ impl eframe::App for DownloadUi {
         self.apply_activation(ctx);
         self.apply_tray(ctx);
         self.handle_window_close(ctx);
+        self.show_close_dialog(ctx);
         let (tasks, notice) = self.model.view();
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -470,6 +576,16 @@ fn file_name_cell(
 }
 
 fn progress_cell(ui: &mut egui::Ui, task: &DownloadTask) {
+    // Declared `size` (from the site/SDK) can disagree with aria2's actual
+    // bytes. Once aria2 reports complete, always show 100%.
+    if task.status == TaskStatus::Complete {
+        ui.add(
+            egui::ProgressBar::new(1.0)
+                .desired_width(180.0)
+                .show_percentage(),
+        );
+        return;
+    }
     if let Some(total) = task.size.filter(|total| *total > 0) {
         let fraction = (task.completed_length as f32 / total as f32).clamp(0.0, 1.0);
         ui.add(
@@ -479,7 +595,7 @@ fn progress_cell(ui: &mut egui::Ui, task: &DownloadTask) {
         );
         return;
     }
-    if task.completed_length > 0 || task.status == TaskStatus::Complete {
+    if task.completed_length > 0 {
         ui.label(format_bytes(task.completed_length));
     } else {
         ui.label("—");
@@ -677,6 +793,7 @@ fn show_main_window(ctx: &egui::Context) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    ctx.request_repaint();
 }
 
 pub fn run_error(

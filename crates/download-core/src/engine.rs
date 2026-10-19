@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use std::path::Path;
+
 use crate::manager::TaskManager;
 use crate::protocol::sanitize_file_name;
 use crate::settings::{clamp_connections, DEFAULT_MAX_CONNECTIONS_PER_SERVER};
@@ -86,24 +88,59 @@ impl<A: Aria2Api> DownloadEngine<A> {
 
     /// Registers the task and starts it in aria2. The same URL returns the existing id.
     ///
-    /// A previous attempt that never received a gid is started again. A task that
-    /// already has a gid is left as-is.
+    /// - Active / paused / error tasks with a known row are left or retried in place.
+    /// - A **completed** URL may be submitted again as a new task (duplicate download);
+    ///   existing files are kept (`auto-file-renaming` on `addUri`).
+    /// - A previous attempt that never received a gid is started again.
     pub async fn submit(&mut self, mut req: NewTaskRequest) -> Result<TaskId, String> {
         require_http_url(&req.url)?;
         req.file_name = sanitize_file_name(&req.file_name, &req.url);
         let id = {
             let mut manager = self.manager.lock().await;
-            manager.add(req)?
+            manager.add(req.clone())?
         };
-        let already_started = {
+
+        enum Plan {
+            Keep,
+            Start,
+            Restart { old_gid: Option<String> },
+        }
+        let plan = {
             let manager = self.manager.lock().await;
-            manager
-                .get(&id)
-                .map(|task| task.gid.is_some())
-                .unwrap_or(false)
+            match manager.get(&id) {
+                Some(task)
+                    if matches!(task.status, TaskStatus::Active | TaskStatus::Paused)
+                        && task.gid.is_some() =>
+                {
+                    Plan::Keep
+                }
+                Some(task) if task.status == TaskStatus::Error => Plan::Restart {
+                    old_gid: task.gid.clone(),
+                },
+                Some(task) if task.gid.is_some() => Plan::Keep,
+                _ => Plan::Start,
+            }
         };
-        if already_started {
-            return Ok(id);
+        match plan {
+            Plan::Keep => return Ok(id),
+            Plan::Restart { old_gid } => {
+                if let Some(gid) = old_gid.as_deref() {
+                    ignore_missing_download(self.aria2.remove_download_result(gid).await)?;
+                }
+                let mut manager = self.manager.lock().await;
+                if let Some(task) = manager.get_mut(&id) {
+                    task.file_name = req.file_name.clone();
+                    if req.size.is_some() {
+                        task.size = req.size;
+                    }
+                    task.gid = None;
+                    task.completed_length = 0;
+                    task.download_speed = 0;
+                    task.error = None;
+                    task.status = TaskStatus::Queued;
+                }
+            }
+            Plan::Start => {}
         }
 
         let (url, stored_name) = {
@@ -256,6 +293,14 @@ fn ignore_missing_download(result: Result<(), String>) -> Result<(), String> {
 
 fn apply_aria2_status(task: &mut DownloadTask, value: &Value) {
     task.completed_length = json_u64(value, "completedLength");
+    let total = json_u64(value, "totalLength");
+    // Prefer aria2's measured size over the optional size from the site/SDK.
+    if total > 0 {
+        task.size = Some(total);
+    }
+    if let Some(name) = aria2_file_name(value) {
+        task.file_name = name;
+    }
     let speed = json_u64(value, "downloadSpeed");
     let status = value.get("status").and_then(Value::as_str).unwrap_or("");
     match status {
@@ -272,6 +317,10 @@ fn apply_aria2_status(task: &mut DownloadTask, value: &Value) {
             task.status = TaskStatus::Complete;
             task.download_speed = 0;
             task.error = None;
+            // Align declared size with bytes actually written so progress is 100%.
+            if task.completed_length > 0 {
+                task.size = Some(task.completed_length);
+            }
         }
         "error" => {
             task.status = TaskStatus::Error;
@@ -289,6 +338,22 @@ fn apply_aria2_status(task: &mut DownloadTask, value: &Value) {
             task.error = Some(format!("unknown aria2 status: {other}"));
         }
     }
+}
+
+/// Basename from aria2 `files[0].path` (reflects auto-renamed names like `a.1.zip`).
+fn aria2_file_name(value: &Value) -> Option<String> {
+    let path = value
+        .get("files")?
+        .as_array()?
+        .first()?
+        .get("path")?
+        .as_str()
+        .filter(|path| !path.is_empty())?;
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(|name| name.to_string())
 }
 
 fn aria2_error_message(value: &Value) -> String {

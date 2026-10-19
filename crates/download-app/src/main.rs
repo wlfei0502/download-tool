@@ -1,3 +1,7 @@
+// Release builds are a GUI app: no console window on double-click / dltool://.
+// Debug builds keep the console for `cargo run` logs.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod fonts;
 mod platform;
 mod single_instance;
@@ -131,6 +135,7 @@ async fn prepare(activation: Activation) -> Result<DownloadUi, String> {
         &mut engine,
         &tasks,
         single_instance::requests_from_args(&startup),
+        &activation,
     )
     .await;
     let settings_for_ui = stored.values.clone();
@@ -142,6 +147,7 @@ async fn prepare(activation: Activation) -> Result<DownloadUi, String> {
         model.clone(),
         stored,
         store,
+        activation.clone(),
     ));
 
     Ok(DownloadUi::new(
@@ -168,8 +174,14 @@ fn api_router(
     aria2_ready: Arc<AtomicBool>,
     activation: Activation,
 ) -> Router {
+    let on_task = activation.clone();
     with_cors(
-        routes(AppState { tasks, aria2_ready }).merge(
+        routes(AppState {
+            tasks,
+            aria2_ready,
+            on_task_added: Some(Arc::new(move || on_task.request_show())),
+        })
+        .merge(
             Router::new()
                 .route("/v1/invoke", post(invoke).options(preflight))
                 .with_state(activation),
@@ -395,6 +407,7 @@ async fn run_engine(
     model: SharedModel,
     mut stored: StoredSettings,
     store: Arc<TaskStore>,
+    activation: Activation,
 ) {
     let mut ticker = tokio::time::interval(Duration::from_millis(500));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -404,7 +417,15 @@ async fn run_engine(
                 let Some(command) = command else {
                     break;
                 };
-                handle_command(&mut engine, &tasks, &mut stored, command, &model).await;
+                handle_command(
+                    &mut engine,
+                    &tasks,
+                    &mut stored,
+                    command,
+                    &model,
+                    &activation,
+                )
+                .await;
                 publish(&tasks, &model, &store).await;
             }
             _ = ticker.tick() => {
@@ -426,6 +447,7 @@ async fn handle_command(
     stored: &mut StoredSettings,
     command: Command,
     model: &SharedModel,
+    activation: &Activation,
 ) {
     match command {
         Command::UpdateSettings(next) => {
@@ -436,7 +458,7 @@ async fn handle_command(
             file_name,
             save_dir: dir,
         } => {
-            add_task(engine, tasks, stored, dir, url, file_name, model).await;
+            add_task(engine, tasks, stored, dir, url, file_name, model, activation).await;
         }
         Command::Pause(id) => control(engine, tasks, model, &id, Control::Pause).await,
         Command::Resume(id) => control(engine, tasks, model, &id, Control::Resume).await,
@@ -493,6 +515,7 @@ async fn add_task(
     url: String,
     file_name: String,
     model: &SharedModel,
+    activation: &Activation,
 ) {
     if let Err(err) = ui::validate_task_input(&url, &file_name) {
         model.set_notice(Some(err));
@@ -520,16 +543,22 @@ async fn add_task(
         .map(|err| format!("无法保存设置：{err}"));
     let Some(engine) = engine.as_mut() else {
         match tasks.lock().await.add(request) {
-            Ok(_) => model.set_notice(Some(save_error.unwrap_or_else(|| {
-                "已加入队列。未找到 aria2c，下载尚未开始。".into()
-            }))),
+            Ok(_) => {
+                activation.request_show();
+                model.set_notice(Some(save_error.unwrap_or_else(|| {
+                    "已加入队列。未找到 aria2c，下载尚未开始。".into()
+                })));
+            }
             Err(err) => model.set_notice(Some(err)),
         }
         return;
     };
     engine.set_save_dir(&dir);
     match engine.submit(request).await {
-        Ok(_) => model.set_notice(save_error),
+        Ok(_) => {
+            activation.request_show();
+            model.set_notice(save_error);
+        }
         Err(err) => model.set_notice(Some(err)),
     }
 }
@@ -663,7 +692,9 @@ async fn enqueue_requests(
     engine: &mut Option<DownloadEngine<Aria2Client>>,
     tasks: &Arc<Mutex<TaskManager>>,
     requests: Vec<NewTaskRequest>,
+    activation: &Activation,
 ) {
+    let mut added = false;
     for request in requests {
         let label = request.file_name.clone();
         let result = if let Some(engine) = engine.as_mut() {
@@ -671,9 +702,13 @@ async fn enqueue_requests(
         } else {
             tasks.lock().await.add(request).map(|_| ())
         };
-        if let Err(err) = result {
-            eprintln!("could not enqueue {label}: {err}");
+        match result {
+            Ok(()) => added = true,
+            Err(err) => eprintln!("could not enqueue {label}: {err}"),
         }
+    }
+    if added {
+        activation.request_show();
     }
 }
 
@@ -754,6 +789,56 @@ mod tests {
         assert!(addr.ip().is_loopback());
         assert_eq!(addr.port(), DEFAULT_PORT);
         assert_eq!(DEFAULT_PORT, 29128);
+    }
+
+    #[tokio::test]
+    async fn create_task_asks_the_window_to_show() {
+        let activation = Activation::new();
+        let router = api_router(
+            Arc::new(Mutex::new(TaskManager::new())),
+            Arc::new(AtomicBool::new(true)),
+            activation.clone(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("tasks listener");
+        let addr = listener.local_addr().expect("tasks addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("tasks server");
+        });
+        for _ in 0..50 {
+            if tokio::net::TcpStream::connect(addr).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let body = br#"{"url":"http://example.com/a.zip","fileName":"a.zip","size":10}"#;
+        let response = tokio::task::spawn_blocking(move || {
+            use std::io::{Read, Write};
+            let mut client = std::net::TcpStream::connect(addr).expect("connect tasks");
+            client
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            client
+                .set_write_timeout(Some(Duration::from_secs(2)))
+                .expect("write timeout");
+            let request = format!(
+                "POST /v1/tasks HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            client.write_all(request.as_bytes()).expect("write head");
+            client.write_all(body).expect("write body");
+            let mut response = String::new();
+            client.read_to_string(&mut response).expect("read tasks");
+            response
+        })
+        .await
+        .expect("tasks client");
+        assert!(response.contains("200"), "{response}");
+        assert!(response.contains("taskId"), "{response}");
+        assert!(activation.take_show());
+        server.abort();
     }
 
     #[tokio::test]
@@ -1044,7 +1129,9 @@ mod tests {
             "ftp://example.com/nope".into(),
         ]);
         let mut engine = None;
-        enqueue_requests(&mut engine, &tasks, requests).await;
+        let activation = Activation::new();
+        enqueue_requests(&mut engine, &tasks, requests, &activation).await;
+        assert!(activation.take_show());
         let mut listed = tasks.lock().await.list();
         listed.sort_by(|left, right| left.file_name.cmp(&right.file_name));
         assert_eq!(listed.len(), 3);
@@ -1071,6 +1158,8 @@ mod tests {
                 global_speed_limit_bps: None,
                 max_connections_per_server: 8,
                 autostart: true,
+                close_ask: true,
+                close_action: download_core::settings::CloseAction::Tray,
             },
             path: Some(path.clone()),
         };
@@ -1084,6 +1173,8 @@ mod tests {
                 global_speed_limit_bps: Some(2048),
                 max_connections_per_server: 4,
                 autostart: true,
+                close_ask: false,
+                close_action: download_core::settings::CloseAction::Quit,
             },
             &model,
         )
@@ -1094,6 +1185,11 @@ mod tests {
         assert_eq!(loaded.global_speed_limit_bps, Some(2048));
         assert_eq!(loaded.max_connections_per_server, 4);
         assert!(loaded.autostart);
+        assert!(!loaded.close_ask);
+        assert_eq!(
+            loaded.close_action,
+            download_core::settings::CloseAction::Quit
+        );
         assert!(save_dir.is_dir());
         let (_, notice) = model.view();
         assert_eq!(notice, None);

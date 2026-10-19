@@ -60,6 +60,9 @@ impl Aria2Client {
             "dir": dir,
             "out": out,
             "max-connection-per-server": max_connections.to_string(),
+            // Keep existing files; aria2 picks out.1, out.2, … for duplicates.
+            "allow-overwrite": "false",
+            "auto-file-renaming": "true",
         });
         let result = self
             .call("aria2.addUri", vec![json!([url]), options])
@@ -121,7 +124,8 @@ impl Aria2Client {
                     "totalLength",
                     "completedLength",
                     "downloadSpeed",
-                    "errorMessage"
+                    "errorMessage",
+                    "files"
                 ]),
             ],
         )

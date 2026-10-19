@@ -1,8 +1,10 @@
 //! Status-item menu: Show, Pause all, and Quit.
 //!
 //! The icon is created on the UI thread after eframe's event loop is running.
-//! Menu clicks are forwarded on a side thread so the egui loop wakes immediately.
+//! Menu clicks and left double-clicks are forwarded on side threads so the egui
+//! loop wakes immediately.
 
+use download_core::settings::CloseAction;
 use download_core::task::DownloadTask;
 use download_core::task::TaskStatus;
 
@@ -41,11 +43,18 @@ impl Tray {
             .build()
             .map_err(|err| err.to_string())?;
 
-        let ctx = ctx.clone();
+        let menu_ctx = ctx.clone();
+        let menu_tx = events_tx.clone();
         std::thread::Builder::new()
             .name("tray-menu".into())
-            .spawn(move || listen_for_menu(events_tx, ctx))
+            .spawn(move || listen_for_menu(menu_tx, menu_ctx))
             .map_err(|err| format!("start tray menu listener: {err}"))?;
+
+        let icon_ctx = ctx.clone();
+        std::thread::Builder::new()
+            .name("tray-icon".into())
+            .spawn(move || listen_for_icon(events_tx, icon_ctx))
+            .map_err(|err| format!("start tray icon listener: {err}"))?;
 
         Ok(Self { icon, events })
     }
@@ -66,6 +75,26 @@ fn listen_for_menu(events_tx: std::sync::mpsc::Sender<TrayAction>, ctx: egui::Co
             continue;
         };
         if events_tx.send(action).is_err() {
+            break;
+        }
+        ctx.request_repaint();
+    }
+}
+
+fn listen_for_icon(events_tx: std::sync::mpsc::Sender<TrayAction>, ctx: egui::Context) {
+    let receiver = tray_icon::TrayIconEvent::receiver();
+    while let Ok(event) = receiver.recv() {
+        let show = matches!(
+            event,
+            tray_icon::TrayIconEvent::DoubleClick {
+                button: tray_icon::MouseButton::Left,
+                ..
+            }
+        );
+        if !show {
+            continue;
+        }
+        if events_tx.send(TrayAction::Show).is_err() {
             break;
         }
         ctx.request_repaint();
@@ -105,11 +134,34 @@ pub fn action_for_menu_id(id: &str) -> Option<TrayAction> {
     }
 }
 
-/// Closing the window hides it while the tray is installed.
-/// Quit, or a tray that failed to install, lets the process exit so the
-/// aria2 child is stopped with the window.
-pub fn hide_on_close(tray_installed: bool, quit_requested: bool) -> bool {
-    tray_installed && !quit_requested
+/// How the main window close button should be handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseDecision {
+    /// Show the tray-or-quit confirmation.
+    Ask,
+    /// Minimize to the tray (keep running).
+    Tray,
+    /// Exit the process.
+    Quit,
+}
+
+/// Decide what closing the window does, given tray availability and saved prefs.
+pub fn close_decision(
+    tray_installed: bool,
+    quit_requested: bool,
+    close_ask: bool,
+    close_action: CloseAction,
+) -> CloseDecision {
+    if quit_requested || !tray_installed {
+        return CloseDecision::Quit;
+    }
+    if close_ask {
+        return CloseDecision::Ask;
+    }
+    match close_action {
+        CloseAction::Tray => CloseDecision::Tray,
+        CloseAction::Quit => CloseDecision::Quit,
+    }
 }
 
 /// Active downloads and not-yet-started queued tasks.
@@ -159,9 +211,10 @@ pub fn download_icon_rgba(size: u32, color: [u8; 4]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        action_for_menu_id, download_icon_rgba, hide_on_close, pause_all_ids, PAUSE_ALL_ID,
-        QUIT_ID, SHOW_ID,
+        action_for_menu_id, close_decision, download_icon_rgba, pause_all_ids, CloseDecision,
+        PAUSE_ALL_ID, QUIT_ID, SHOW_ID,
     };
+    use download_core::settings::CloseAction;
     use download_core::task::{DownloadTask, NewTaskRequest, TaskStatus};
 
     #[test]
@@ -176,11 +229,27 @@ mod tests {
     }
 
     #[test]
-    fn close_hides_until_quit_or_missing_tray() {
-        assert!(hide_on_close(true, false));
-        assert!(!hide_on_close(true, true));
-        assert!(!hide_on_close(false, false));
-        assert!(!hide_on_close(false, true));
+    fn close_decision_asks_by_default_then_honors_saved_action() {
+        assert_eq!(
+            close_decision(true, false, true, CloseAction::Tray),
+            CloseDecision::Ask
+        );
+        assert_eq!(
+            close_decision(true, false, false, CloseAction::Tray),
+            CloseDecision::Tray
+        );
+        assert_eq!(
+            close_decision(true, false, false, CloseAction::Quit),
+            CloseDecision::Quit
+        );
+        assert_eq!(
+            close_decision(true, true, true, CloseAction::Tray),
+            CloseDecision::Quit
+        );
+        assert_eq!(
+            close_decision(false, false, true, CloseAction::Tray),
+            CloseDecision::Quit
+        );
     }
 
     #[test]

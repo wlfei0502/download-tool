@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 
 use super::rpc::Aria2Client;
 
@@ -122,7 +122,18 @@ impl Aria2Process {
             );
         }
         let mut command = Command::new(&bin);
-        command.args(&args);
+        command
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        // Prevent a flash of aria2c's own console on Windows GUI launches.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
         let child = command
             .spawn()
             .map_err(|err| format!("failed to spawn {}: {err}", bin.display()))?;

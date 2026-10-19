@@ -21,6 +21,8 @@ pub struct AppState {
     pub tasks: Arc<Mutex<TaskManager>>,
     /// Set when aria2 JSON-RPC is ready to accept downloads.
     pub aria2_ready: Arc<AtomicBool>,
+    /// Called after a task is accepted via `POST /v1/tasks` (show the main window).
+    pub on_task_added: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
 }
 
 /// Routes for `GET /health`, `POST /v1/tasks`, and `GET /v1/tasks`, without CORS.
@@ -184,7 +186,12 @@ async fn create_task(
     };
     let mut tasks = state.tasks.lock().await;
     match tasks.add(req) {
-        Ok(id) => Ok(Json(CreateTaskResponse { task_id: id.0 })),
+        Ok(id) => {
+            if let Some(notify) = &state.on_task_added {
+                notify();
+            }
+            Ok(Json(CreateTaskResponse { task_id: id.0 }))
+        }
         Err(error) => Err((StatusCode::BAD_REQUEST, Json(ErrorBody { error }))),
     }
 }

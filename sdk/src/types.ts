@@ -7,6 +7,11 @@ export type DownloadConfig = {
   localPort?: number;
   /** Custom protocol scheme. Default "dltool". */
   protocol?: string;
+  /**
+   * How long to poll `/health` after opening `dltool://` before install fallback.
+   * Default 15000 — browsers often ask the user to confirm opening the app first.
+   */
+  protocolSettleMs?: number;
 };
 
 export type DownloadOptions = {

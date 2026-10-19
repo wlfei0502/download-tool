@@ -17,6 +17,7 @@ fn state_with_aria2(ready: bool) -> AppState {
     AppState {
         tasks: Arc::new(Mutex::new(TaskManager::new())),
         aria2_ready: Arc::new(AtomicBool::new(ready)),
+        on_task_added: None,
     }
 }
 
